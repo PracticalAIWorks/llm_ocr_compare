@@ -8,6 +8,7 @@ from document_comparison.models import (
     Block,
     Diff,
     PageMeta,
+    PageRegion,
     PageRecognitionDiagnostic,
     TamperReport,
 )
@@ -113,6 +114,10 @@ class _FallbackOCR:
         ]]
 
 
+class _TruncatedFallbackOCR(_FallbackOCR):
+    last_truncated_pages = {0}
+
+
 def test_trusted_reader_sends_only_non_native_pages_to_fallback(tmp_path: Path):
     pdf_path = tmp_path / "mixed.pdf"
     _make_mixed_pdf(pdf_path)
@@ -127,25 +132,82 @@ def test_trusted_reader_sends_only_non_native_pages_to_fallback(tmp_path: Path):
     assert "OCR text recovered" in pages[1][0].content
     assert [item.source for item in engine.last_diagnostics] == ["native", "fallback"]
     assert all(item.reliable for item in engine.last_diagnostics)
+    assert all(item.location_status == "complete" for item in engine.last_diagnostics)
 
 
-def test_unreliable_recognition_suppresses_high_risk_conclusion():
+def test_trusted_reader_marks_truncated_fallback_page_unreliable(tmp_path: Path):
+    pdf_path = tmp_path / "mixed.pdf"
+    _make_mixed_pdf(pdf_path)
+    engine = TrustedPDFReader(_TruncatedFallbackOCR())
+
+    engine.recognize(pdf_path, get_page_metas(pdf_path))
+
+    diagnostic = engine.last_diagnostics[1]
+    assert diagnostic.page_index == 1
+    assert diagnostic.reliable is False
+    assert "达到输出上限" in diagnostic.reasons[-1]
+
+
+def test_fallback_diagnostic_tracks_location_without_changing_recognition_quality():
+    from document_comparison.ocr.trusted import assess_fallback_page
+
+    diagnostic = assess_fallback_page(
+        [
+            Block(
+                block_id="located",
+                page_index=0,
+                label="text",
+                bbox=[10, 10, 100, 30],
+                content="已定位文字",
+            ),
+            Block(
+                block_id="missing",
+                page_index=0,
+                label="text",
+                bbox=[],
+                content="这一段文字没有坐标但识别内容仍然可靠",
+            ),
+        ],
+        0,
+    )
+
+    assert diagnostic.reliable is True
+    assert diagnostic.location_status == "partial"
+    assert 0 < diagnostic.bbox_coverage < 1
+
+
+def test_unreliable_recognition_marks_only_related_diff_for_review():
     report = TamperReport(
         source="source.docx",
         target="target.pdf",
         overall_risk="high",
+        change_status="changed",
         diffs=[
             Diff(
                 alignment_id="al1",
                 status="modified",
                 risk_level="high",
                 risk_reasons=["金额发生变化"],
-            )
+                page_regions=[PageRegion(page_index=0, bbox=[0, 0, 1, 1])],
+            ),
+            Diff(
+                alignment_id="al2",
+                status="modified",
+                risk_level="high",
+                risk_reasons=["账号发生变化"],
+                page_regions=[PageRegion(page_index=1, bbox=[0, 0, 1, 1])],
+            ),
         ],
     )
     diagnostics = [
         PageRecognitionDiagnostic(
             page_index=0,
+            source="native",
+            reliable=True,
+            char_count=120,
+        ),
+        PageRecognitionDiagnostic(
+            page_index=1,
             source="fallback",
             reliable=False,
             reasons=["OCR 返回连续重复内容"],
@@ -153,9 +215,38 @@ def test_unreliable_recognition_suppresses_high_risk_conclusion():
         )
     ]
 
+    apply_recognition_gate(report, diagnostics, enable_risk_assessment=True)
+
+    assert report.overall_risk == "high"
+    assert report.change_status == "changed"
+    assert report.recognition_status == "needs_review"
+    assert report.diffs[0].verdict == "changed"
+    assert report.diffs[0].confidence == "high"
+    assert report.diffs[0].risk_reasons == ["金额发生变化"]
+    assert report.diffs[1].verdict == "needs_review"
+    assert report.diffs[1].confidence == "low"
+    assert report.diffs[1].risk_level == "high"
+    assert "识别质量不足" in report.diffs[1].risk_reasons[-1]
+
+
+def test_unreliable_recognition_prevents_empty_report_from_being_clean():
+    report = TamperReport(
+        source="source.docx",
+        target="target.pdf",
+        overall_risk="clean",
+        change_status="clean",
+    )
+    diagnostics = [
+        PageRecognitionDiagnostic(
+            page_index=0,
+            source="fallback",
+            reliable=False,
+            reasons=["OCR 返回内容为空或字符过少"],
+            char_count=2,
+        )
+    ]
+
     apply_recognition_gate(report, diagnostics)
 
     assert report.overall_risk == "needs_review"
-    assert report.recognition_status == "needs_review"
-    assert report.diffs[0].risk_level == "low"
-    assert "识别质量不足" in report.diffs[0].risk_reasons[-1]
+    assert report.change_status == "needs_review"

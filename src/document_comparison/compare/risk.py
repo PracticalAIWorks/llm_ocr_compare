@@ -12,7 +12,7 @@ def max_risk(levels: list[RiskLevel]) -> RiskLevel:
     return max(levels, key=lambda lv: _RISK_ORDER[lv])
 
 
-def overall_risk_from_diffs(high_or_modify_present: bool, levels: list[RiskLevel]) -> str:
+def overall_risk_from_diffs(levels: list[RiskLevel]) -> str:
     """汇总为 overall_risk:无任何 diff → clean,否则取最高风险。"""
     if not levels:
         return "clean"
@@ -51,13 +51,13 @@ def classify_diff(
     if table_change_reason:
         return "modified", "medium", [table_change_reason]
 
-    # 高相似度且无要素变化 → 视为 OCR 噪声
-    if similarity >= sim_identical:
-        return "identical", "none", []
+    # sim_identical 仅为旧调用方兼容参数。零容忍策略下，语义相似度无权
+    # 把已经确认存在的字符差异抹成 identical。
+    _ = sim_identical
 
     # 相似度显著下降 → 实质修改
     if similarity < sim_modified:
         return "modified", "medium", [f"语义相似度显著下降({similarity:.2f})"]
 
-    # 中间区间:疑似差异,提示人工抽检
-    return "modified", "low", [f"疑似差异,相似度 {similarity:.2f}"]
+    # 中间区间:仍是确认字符变化；相似度仅用于严重度排序。
+    return "modified", "low", [f"已确认字符差异,相似度 {similarity:.2f}"]

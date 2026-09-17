@@ -2,12 +2,18 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import ProgressTracker from '@/components/ProgressTracker.vue'
-import OverallBadge from '@/components/OverallBadge.vue'
-import DiffList from '@/components/DiffList.vue'
+import DiffComparisonTable from '@/components/DiffComparisonTable.vue'
 import KeyElementTable from '@/components/KeyElementTable.vue'
 import PdfViewer from '@/components/PdfViewer.vue'
-import DocxPreview from '@/components/DocxPreview.vue'
-import { ApiError, getAnnotatedDocxUrl, getSourcePdfUrl } from '@/api/compare'
+import {
+  ApiError,
+  getHtmlReportUrl,
+  getOriginalPdfUrl,
+  getPdfReportUrl,
+  getSourceFileDownloadUrl,
+  getSourcePdfUrl,
+  getTargetFileDownloadUrl,
+} from '@/api/compare'
 import { useTaskStore } from '@/stores/task'
 import { useReportStore } from '@/stores/report'
 import type { Diff, TamperReport } from '@/api/types'
@@ -45,30 +51,53 @@ onBeforeUnmount(() => {
 taskStore.dispose()
 })
 
-const showPdf = ref(false)
-const showDocx = ref(true)
+const showPreview = ref(false)
+const sharedPdfZoom = ref(1)
 const filter = ref<'all' | 'risk' | 'modified'>('all')
 const selectedClauseId = ref<string | null>(null)
 
+const changeStatusText = computed(() => ({
+  clean: '未发现内容变化',
+  changed: '发现确认内容变化',
+  needs_review: '存在待人工复核内容',
+}[reportStore.report?.change_status ?? 'clean']))
+
 const visibleDiffs = computed<Diff[]>(() => {
-const list = reportStore.diffsBySeverity
+const list = reportStore.diffs
 if (filter.value === 'risk') return list.filter((d) => d.risk_level !== 'none')
 if (filter.value === 'modified') return list.filter((d) => d.status === 'modified')
 return list
 })
 
+// 是否存在任何带风险等级的 diff(关闭风险判别时所有 diff.risk_level 都是 'none',
+// 此时隐藏「有风险」筛选 chip;开启风险时若有非 none 风险才显示)。
+const hasRiskDiffs = computed<boolean>(() =>
+reportStore.diffs.some((d) => d.risk_level !== 'none'),
+)
+// 高风险要素校验区:仅在报告里实际抽取到要素时才渲染
+// (关闭风险判别时 key_elements 为空,该区自动隐藏)。
+const hasKeyElements = computed<boolean>(() => reportStore.keyElements.length > 0)
+const hasSourcePdfPreview = computed<boolean>(() =>
+  reportStore.report?.source_annotation_status !== 'unavailable',
+)
+const hasBidirectionalPdfPreview = computed<boolean>(() =>
+  hasSourcePdfPreview.value
+  && reportStore.hasPdfHighlights,
+)
+
 const pdfUrl = computed(() => {
 return getSourcePdfUrl(props.taskId)
 })
-
-const annotatedDocxUrl = computed(() => getAnnotatedDocxUrl(props.taskId))
+const originalPdfUrl = computed(() => getOriginalPdfUrl(props.taskId))
+const sourceFileDownloadUrl = computed(() => getSourceFileDownloadUrl(props.taskId))
+const targetFileDownloadUrl = computed(() => getTargetFileDownloadUrl(props.taskId))
+const htmlReportUrl = computed(() => getHtmlReportUrl(props.taskId))
+const pdfReportUrl = computed(() => getPdfReportUrl(props.taskId))
 
 /** 点击条款 → 选中 + 展开 PDF 预览 + 滚动到对应页 */
 function onSelectClause(id: string) {
   selectedClauseId.value = id
-  if (!showPdf.value) {
-    showPdf.value = true
-  }
+  showPreview.value = true
 }
 </script>
 
@@ -84,21 +113,18 @@ function onSelectClause(id: string) {
         :status="taskStore.status"
         :stage="taskStore.stage"
         :progress="taskStore.progress"
+        :stage-timings="taskStore.stageTimings"
         :overall-risk="taskStore.overallRisk"
         :error="taskStore.error"
         :elapsed="taskStore.elapsed"
         />
         </div>
         <div class="head-actions">
-        <a
-          v-if="reportStore.diffs.length || reportStore.unmatched.length"
-          class="btn btn-primary"
-          :href="annotatedDocxUrl"
-          download
-        >
-          下载高亮 Word
-        </a>
-        <button class="btn" type="button" @click="router.push('/')">新建比对</button>
+        <a class="btn" :href="sourceFileDownloadUrl">下载采购部合同</a>
+        <a class="btn" :href="targetFileDownloadUrl">下载供应商合同</a>
+        <a class="btn" :href="pdfReportUrl">下载 PDF 报告</a>
+        <a class="btn" :href="htmlReportUrl">导出 HTML</a>
+        <button class="btn" type="button" @click="router.push('/compare')">新建比对</button>
         </div>
     </header>
 
@@ -106,11 +132,51 @@ function onSelectClause(id: string) {
 
     <template v-if="reportStore.report">
         <section
+          v-if="reportStore.report.truncation"
+          class="card truncation-warning"
+        >
+          <h3 class="section-title">供应商合同页数已截取</h3>
+          <p v-if="reportStore.report.truncation.truncation_reason === 'auto_trailing_drawings'">
+            供应商合同 PDF 共
+            <strong>{{ reportStore.report.truncation.original_pdf_page_count }}</strong> 页，
+            自动识别并排除尾部图纸第
+            <strong>{{ reportStore.report.truncation.excluded_page_numbers.join('、') }}</strong> 页，
+            保留前
+            <strong>{{ reportStore.report.truncation.truncated_pdf_page_count }}</strong> 页进行正文比对。
+            <span v-if="reportStore.report.truncation.detection_confidence !== null" class="muted small">
+              （最低识别置信度 {{ Math.round(reportStore.report.truncation.detection_confidence * 100) }}%）
+            </span>
+          </p>
+          <p v-else-if="reportStore.report.truncation.truncation_reason === 'manual_target_body_end_page'">
+            供应商合同 PDF 共
+            <strong>{{ reportStore.report.truncation.original_pdf_page_count }}</strong> 页，
+            按调用方指定的正文截止页保留前
+            <strong>{{ reportStore.report.truncation.truncated_pdf_page_count }}</strong> 页，
+            第 <strong>{{ reportStore.report.truncation.excluded_page_numbers.join('、') }}</strong> 页未参与比对。
+          </p>
+          <p v-else>
+            供应商合同 PDF 共
+            <strong>{{ reportStore.report.truncation.original_pdf_page_count }}</strong> 页,
+            超过采购部合同
+            <strong>{{ reportStore.report.truncation.original_doc_page_count }}</strong> 页
+            <span class="muted small">
+              ({{
+                reportStore.report.truncation.doc_page_count_source === 'explicit'
+                  ? '外部显式传入'
+                  : 'OOXML 估算'
+              }})
+            </span>,
+            已截取前
+            <strong>{{ reportStore.report.truncation.truncated_pdf_page_count }}</strong> 页
+            进行比对,超出部分未纳入本次比对。
+          </p>
+        </section>
+        <section
           v-if="reportStore.report.recognition_status === 'needs_review'"
           class="card recognition-warning"
         >
-          <h3 class="section-title">识别质量不足，已暂停自动高风险结论</h3>
-          <p>以下差异仅供人工复核。请优先检查识别异常页面，确认文字后再判断合同风险。</p>
+          <h3 class="section-title">部分页面识别质量不足</h3>
+          <p>仅关联异常页面的差异会标记为待复核；其他可靠页面上的确认变化保持原结论。</p>
           <ul>
             <li
               v-for="item in reportStore.report.recognition_diagnostics.filter((d) => !d.reliable)"
@@ -121,89 +187,147 @@ function onSelectClause(id: string) {
           </ul>
         </section>
 
-        <section class="card">
-        <div class="summary">
-        <div class="sum-item">
-            <OverallBadge :level="reportStore.overallRisk" />
-        </div>
-        <div class="sum-item">
-            <span class="sum-num">{{ reportStore.counts.total }}</span>
-            <span class="muted">条款总数</span>
-        </div>
-        <div class="sum-item">
-            <span class="sum-num warn">{{ reportStore.counts.modified }}</span>
-            <span class="muted">已修改</span>
-        </div>
-        <div class="sum-item">
-            <span class="sum-num">{{ reportStore.counts.added }}</span>
-            <span class="muted">PDF 新增</span>
-        </div>
-        <div class="sum-item">
-            <span class="sum-num">{{ reportStore.counts.deleted }}</span>
-           <span class="muted">缺失</span>
-       </div>
-       </div>
-       </section>
+        <section
+          v-if="reportStore.report.location_status !== 'complete'"
+          class="card recognition-warning"
+        >
+          <h3 class="section-title">部分页面无法完整定位高亮</h3>
+          <p>这只影响 PDF 标注位置，不改变文字比对和合同变化结论。</p>
+          <ul>
+            <li
+              v-for="item in reportStore.report.recognition_diagnostics.filter((d) => d.location_status !== 'complete')"
+              :key="`location-${item.page_index}`"
+            >
+              第 {{ item.page_index + 1 }} 页：坐标覆盖率 {{ Math.round(item.bbox_coverage * 100) }}%
+            </li>
+          </ul>
+        </section>
 
-        <section class="card">
+        <section class="card report-meta">
+          <div><b>任务编号:</b> {{ taskId }}</div>
+          <div><b>结论:</b> <span :class="['verdict-badge', `verdict-${reportStore.report.change_status}`]">{{ changeStatusText }}</span></div>
+          <div><b>识别状态:</b> {{ reportStore.report.recognition_status === 'reliable' ? '可靠' : '待人工复核' }}</div>
+          <div><b>高亮定位:</b> {{ ({ complete: '完整', partial: '部分缺失', missing: '缺失' })[reportStore.report.location_status] }}</div>
+          <div><b>差异数量:</b> {{ reportStore.counts.total + reportStore.counts.unmatched }}</div>
+        </section>
+
+        <section v-if="hasKeyElements" class="card">
         <h3 class="section-title">高风险要素校验</h3>
         <KeyElementTable :elements="reportStore.keyElements" />
         </section>
 
-        <section class="card">
+        <section class="card diff-section">
         <div class="list-head">
         <h3 class="section-title" style="margin: 0">条款差异</h3>
         <div class="filters">
             <button :class="['chip', { on: filter === 'all' }]" @click="filter = 'all'">全部</button>
-            <button :class="['chip', { on: filter === 'risk' }]" @click="filter = 'risk'">有风险</button>
+            <button v-if="hasRiskDiffs" :class="['chip', { on: filter === 'risk' }]" @click="filter = 'risk'">有风险</button>
             <button :class="['chip', { on: filter === 'modified' }]" @click="filter = 'modified'">已修改</button>
         </div>
         </div>
-        <DiffList
+        <DiffComparisonTable
           :diffs="visibleDiffs"
           :selected-clause-id="selectedClauseId"
           @select="onSelectClause"
         />
         </section>
 
-        <section v-if="reportStore.unmatched.length" class="card">
+        <section v-if="reportStore.unmatched.length" class="card diff-section">
         <h3 class="section-title">未对齐条款({{ reportStore.counts.unmatched }})</h3>
-        <DiffList
+        <DiffComparisonTable
           :diffs="reportStore.unmatched"
-          empty-hint="无"
           :selected-clause-id="selectedClauseId"
           @select="onSelectClause"
         />
         </section>
 
-        <section class="card">
+        <section v-if="hasBidirectionalPdfPreview" class="card pdf-comparison-card">
         <div class="list-head">
-        <h3 class="section-title" style="margin: 0">原文高亮预览</h3>
-        <button class="chip" @click="showDocx = !showDocx">{{ showDocx ? '收起' : '展开' }}</button>
+        <h3 class="section-title" style="margin: 0">合同高亮预览</h3>
+        <button class="chip" @click="showPreview = !showPreview">{{ showPreview ? '统一收起' : '统一展开' }}</button>
         </div>
-        <p v-if="!showDocx" class="muted">展开查看整篇合同，被篡改条款整段高亮（扫描件 PDF 无坐标时仍可在此看到改动位置）。</p>
-        <DocxPreview
-          v-else
-          :task-id="taskId"
-          @select="onSelectClause"
+
+        <div v-if="showPreview" class="pdf-preview-scroll">
+        <div class="pdf-preview-grid">
+        <section class="pdf-preview-pane">
+        <h4 class="preview-pane-title">采购部合同</h4>
+        <PdfViewer
+        :pdf-url="originalPdfUrl"
+        :page-meta="reportStore.report.source_page_meta"
+        :diffs="reportStore.sourcePdfHighlights"
+        side="source"
+        fit-to-container
+        :zoom-level="sharedPdfZoom"
+        :selected-clause-id="selectedClauseId"
+        @select-clause="onSelectClause"
+        @update:zoom-level="sharedPdfZoom = $event"
         />
+        <p v-if="reportStore.report.source_annotation_status === 'partial'" class="muted small">
+          {{ reportStore.report.source_annotation_reason }}
+        </p>
+        </section>
+
+        <section class="pdf-preview-pane">
+        <h4 class="preview-pane-title">供应商合同</h4>
+        <PdfViewer
+        :pdf-url="pdfUrl"
+        :page-meta="reportStore.report.page_meta"
+        :diffs="reportStore.pdfHighlights"
+        side="target"
+        fit-to-container
+        :zoom-level="sharedPdfZoom"
+        :selected-clause-id="selectedClauseId"
+        @select-clause="onSelectClause"
+        @update:zoom-level="sharedPdfZoom = $event"
+        />
+        </section>
+        </div>
+        </div>
+        <p v-else class="muted preview-collapsed-hint">统一展开后可同步查看、滚动和缩放采购部合同与供应商合同。</p>
+        </section>
+
+        <template v-else>
+        <section v-if="hasSourcePdfPreview" class="card pdf-preview-card">
+        <div class="list-head">
+        <h3 class="section-title" style="margin: 0">采购部合同 PDF 预览</h3>
+        <button class="chip" @click="showPreview = !showPreview">{{ showPreview ? '收起' : '展开' }}</button>
+        </div>
+        <PdfViewer
+        v-if="showPreview"
+        :pdf-url="originalPdfUrl"
+        :page-meta="reportStore.report.source_page_meta"
+        :diffs="reportStore.sourcePdfHighlights"
+        side="source"
+        :selected-clause-id="selectedClauseId"
+        @select-clause="onSelectClause"
+        />
+        <p v-if="reportStore.report.source_annotation_status === 'partial'" class="muted small">
+          {{ reportStore.report.source_annotation_reason }}
+        </p>
+        <p v-else class="muted">展开查看采购部合同 PDF 页面与旧值/删除内容的高亮区域。</p>
+        </section>
+
+        <section v-else-if="reportStore.report.source_annotation_reason" class="card source-annotation-note">
+          <p class="muted">采购部合同侧标注不可用：{{ reportStore.report.source_annotation_reason }}</p>
         </section>
 
         <section v-if="reportStore.hasPdfHighlights" class="card">
         <div class="list-head">
-        <h3 class="section-title" style="margin: 0">PDF 预览</h3>
-        <button class="chip" @click="showPdf = !showPdf">{{ showPdf ? '收起' : '展开' }}</button>
+        <h3 class="section-title" style="margin: 0">供应商合同 PDF 预览</h3>
+        <button class="chip" @click="showPreview = !showPreview">{{ showPreview ? '收起' : '展开' }}</button>
         </div>
         <PdfViewer
-        v-if="showPdf"
+        v-if="showPreview"
         :pdf-url="pdfUrl"
         :page-meta="reportStore.report.page_meta"
-        :diffs="reportStore.diffs"
+        :diffs="reportStore.pdfHighlights"
+        side="target"
         :selected-clause-id="selectedClauseId"
         @select-clause="onSelectClause"
         />
-        <p v-else class="muted">展开查看 PDF 页面与高亮区域。</p>
+        <p v-else class="muted">展开查看供应商合同 PDF 页面与高亮区域。</p>
         </section>
+        </template>
     </template>
 
     <section v-else-if="!loadError" class="card">
@@ -223,9 +347,74 @@ gap: 16px;
   border-left: 4px solid var(--risk-medium);
   background: var(--risk-medium-bg);
 }
+.pdf-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: stretch;
+  gap: 16px;
+}
+.pdf-preview-scroll {
+  width: 100%;
+  max-height: min(76vh, 920px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.pdf-comparison-card {
+  min-width: 0;
+}
+.pdf-preview-pane {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.preview-pane-title {
+  min-height: 24px;
+  margin: 0 0 12px;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 24px;
+}
+.preview-collapsed-hint {
+  margin: 0;
+}
+.pdf-preview-card {
+  min-width: 0;
+  overflow-x: auto;
+}
+@media (max-width: 1100px) {
+  .pdf-preview-grid {
+    gap: 6px;
+  }
+  .pdf-preview-card {
+    padding: 8px;
+  }
+  .pdf-preview-pane {
+    padding: 8px;
+  }
+  .pdf-preview-card .section-title {
+    font-size: 14px;
+  }
+}
 .recognition-warning p,
 .recognition-warning ul {
   margin-bottom: 0;
+}
+/* 回收件页数截取提示(等保审计留痕):主色边框,区别于风险提示 */
+.truncation-warning {
+  border-left: 4px solid var(--primary);
+  background: rgba(43, 95, 214, 0.05);
+}
+.truncation-warning p {
+  margin: 0;
+}
+.truncation-warning strong {
+  color: var(--primary);
 }
 .page-title {
 margin: 0 0 10px;
@@ -242,10 +431,50 @@ flex-wrap: wrap;
 gap: 24px;
 align-items: center;
 }
+.report-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+  padding-top: 14px;
+  padding-bottom: 14px;
+  font-size: 14px;
+}
+.report-meta b {
+  color: #444;
+  margin-right: 4px;
+}
+.diff-section {
+  padding: 0;
+  overflow: hidden;
+}
+.diff-section .list-head,
+.diff-section > .section-title {
+  margin: 16px 20px 12px;
+}
 .sum-item {
 display: flex;
 flex-direction: column;
 align-items: flex-start;
+}
+.verdict-badge {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+.verdict-changed {
+  background: var(--risk-medium-bg);
+  color: var(--risk-medium);
+}
+.verdict-needs_review {
+  background: var(--risk-medium-bg);
+  color: var(--risk-medium);
+}
+.verdict-clean {
+  background: var(--risk-none-bg);
+  color: var(--risk-none);
 }
 .sum-num {
 font-size: 22px;
@@ -267,23 +496,6 @@ margin-bottom: 12px;
 .filters {
 display: flex;
 gap: 6px;
-}
-.chip {
-background: var(--surface);
-border: 1px solid var(--border);
-border-radius: 999px;
-padding: 4px 12px;
-font-size: 12px;
-cursor: pointer;
-color: var(--text-muted);
-}
-.chip:hover {
-background: var(--surface-2);
-}
-.chip.on {
-background: var(--primary);
-border-color: var(--primary);
-color: #fff;
 }
 .err {
 color: var(--risk-high);

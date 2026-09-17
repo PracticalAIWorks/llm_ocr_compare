@@ -1,20 +1,26 @@
 // 极简 HTTP 客户端:
 // - 统一错误归一化为 ApiError {code, message, request_id}
 // - 提供 fetch + ReadableStream 的 SSE 读取
+// - 控制台会话失效(401)时统一跳登录页
+import router from '@/router'
+
 export interface NormalizedError {
   code: number
   message: string
   request_id?: string
+  retry_after_seconds?: number
 }
 
 export class ApiError extends Error {
   code: number
   request_id?: string
+  retry_after_seconds?: number
   constructor(e: NormalizedError) {
     super(e.message)
     this.name = 'ApiError'
     this.code = e.code
     this.request_id = e.request_id
+    this.retry_after_seconds = e.retry_after_seconds
   }
 }
 
@@ -30,6 +36,29 @@ interface RequestOptions {
   /** true 时跳过 JSON 解析,返回 Response */
   raw?: boolean
   signal?: AbortSignal
+}
+
+/**
+ * 控制台会话失效(401)时跳登录页并带回跳地址。仅针对控制台业务接口:
+ * /api/v1/auth/*(登录本身)、/api/v1/external/* 与 api-test(独立 X-API-Key)
+ * 的 401 属于业务错误,不触发跳转。
+ */
+const CONSOLE_401_EXEMPT_PREFIXES = ['/api/v1/auth/', '/api/v1/external/']
+const CONSOLE_401_EXEMPT_PATHS = ['/api/v1/compare/api-test']
+
+function redirectToLoginOnConsole401(path: string): void {
+  if (!path.startsWith('/api/')) return
+  if (
+    CONSOLE_401_EXEMPT_PREFIXES.some((p) => path.startsWith(p)) ||
+    CONSOLE_401_EXEMPT_PATHS.includes(path)
+  ) {
+    return
+  }
+  if (router.currentRoute.value.name === 'login') return
+  router.push({
+    name: 'login',
+    query: { redirect: router.currentRoute.value.fullPath },
+  })
 }
 
 async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
@@ -56,6 +85,7 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   }
 
   if (!res.ok) {
+    if (res.status === 401) redirectToLoginOnConsole401(path)
     throw new ApiError(await normalizeError(res))
   }
 
@@ -72,10 +102,18 @@ async function normalizeError(res: Response): Promise<NormalizedError> {
       code: data.code ?? res.status,
       message: data.message ?? res.statusText,
       request_id: data.request_id,
+      retry_after_seconds: parseRetryAfter(res),
     }
   } catch {
-    return { code: res.status, message: res.statusText }
+    return { code: res.status, message: res.statusText, retry_after_seconds: parseRetryAfter(res) }
   }
+}
+
+// 不自动重试提交，避免网络故障后重复创建合同任务。
+function parseRetryAfter(res: Response): number | undefined {
+  const value = res.headers.get('Retry-After')
+  if (!value || !/^\d+$/.test(value)) return undefined
+  return Number(value)
 }
 
 /**
@@ -106,6 +144,7 @@ export function openEventStream(path: string, handlers: SSEHandlers): AbortContr
       return
     }
     if (!res.ok || !res.body) {
+      if (!res.ok && res.status === 401) redirectToLoginOnConsole401(path)
       handlers.onError?.(new ApiError(await normalizeError(res)))
       return
     }

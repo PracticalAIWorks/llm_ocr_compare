@@ -18,6 +18,17 @@ const heading = computed(() => {
 })
 
 const hasInlineDiff = computed(() => props.diff.segments.length > 0)
+const verdictText = computed(() => ({
+  clean: '一致',
+  changed: '确认变化',
+  needs_review: '待复核',
+}[props.diff.verdict] ?? props.diff.verdict))
+
+/** page_regions 是否全部为推断占位框(deleted 在回收件无对应内容,位置为推断)。 */
+const hasOnlyPlaceholderRegions = computed(() =>
+  props.diff.page_regions.length > 0
+  && props.diff.page_regions.every((r) => (r.kind ?? 'real') === 'placeholder'),
+)
 </script>
 
 <template>
@@ -32,7 +43,8 @@ const hasInlineDiff = computed(() => props.diff.segments.length > 0)
     <header class="diff-head">
       <span class="diff-title">{{ heading }}</span>
       <div class="diff-tags">
-        <OverallBadge :level="diff.risk_level" />
+        <OverallBadge v-if="diff.risk_level !== 'none'" :level="diff.risk_level" />
+        <span :class="['verdict-pill', `verdict-${diff.verdict}`]">{{ verdictText }}</span>
         <span class="status-pill">{{ diff.status }}</span>
       </div>
     </header>
@@ -40,6 +52,10 @@ const hasInlineDiff = computed(() => props.diff.segments.length > 0)
     <ul v-if="diff.risk_reasons.length" class="reasons">
       <li v-for="(r, i) in diff.risk_reasons" :key="i">⚠ {{ r }}</li>
     </ul>
+
+    <p v-if="diff.alignment_reason" class="alignment-reason">
+      <span>未对齐原因</span>{{ diff.alignment_reason }}
+    </p>
 
     <div v-if="hasInlineDiff" class="diff-body diff-text">
       <template v-for="(seg, i) in diff.segments" :key="i">
@@ -53,7 +69,12 @@ const hasInlineDiff = computed(() => props.diff.segments.length > 0)
     <p v-else-if="diff.status === 'deleted'" class="muted">仅在 Word 中存在、PDF 缺失</p>
 
     <div v-if="diff.page_regions.length" class="regions muted">
-      关联 PDF 区域:{{ diff.page_regions.length }} 处
+      <template v-if="hasOnlyPlaceholderRegions">
+        推断位置(回收件无对应内容):{{ diff.page_regions.length }} 处
+      </template>
+      <template v-else>
+        关联 PDF 区域:{{ diff.page_regions.length }} 处
+      </template>
       <span v-if="diff.page_regions[0]"> · 第 {{ diff.page_regions[0].page_index + 1 }} 页起</span>
     </div>
   </article>
@@ -91,6 +112,20 @@ const hasInlineDiff = computed(() => props.diff.segments.length > 0)
   gap: 8px;
   margin-bottom: 8px;
 }
+.alignment-reason {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.alignment-reason span {
+  margin-right: 8px;
+  color: var(--text);
+  font-weight: 600;
+}
 .diff-title {
   font-weight: 600;
   word-break: break-word;
@@ -108,6 +143,24 @@ const hasInlineDiff = computed(() => props.diff.segments.length > 0)
   border-radius: 4px;
   padding: 1px 6px;
   text-transform: uppercase;
+}
+.verdict-pill {
+  font-size: 11px;
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-weight: 600;
+}
+.verdict-changed {
+  color: var(--risk-high);
+  background: var(--risk-high-bg);
+}
+.verdict-needs_review {
+  color: var(--risk-medium);
+  background: var(--risk-medium-bg);
+}
+.verdict-clean {
+  color: var(--risk-clean);
+  background: var(--risk-clean-bg);
 }
 .reasons {
   margin: 0 0 8px;

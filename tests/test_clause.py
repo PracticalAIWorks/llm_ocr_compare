@@ -55,6 +55,26 @@ def test_build_clauses_by_number():
     assert "100万元" in clauses[1].text
 
 
+def test_build_clauses_records_parent_section_path():
+    items = [
+        RawItem(text="第一条 付款方式", kind="heading"),
+        RawItem(text="1.1 付款期限", kind="heading"),
+        RawItem(text="（1）验收后30日内付款"),
+        RawItem(text="第二条 违约责任", kind="heading"),
+        RawItem(text="（1）逾期每日承担违约金"),
+    ]
+
+    clauses = build_clauses(items, "word")
+
+    assert clauses[0].parent_path == []
+    assert clauses[1].parent_path[-1].endswith("付款方式")
+    assert [item.split()[-1] for item in clauses[2].parent_path] == [
+        "付款方式",
+        "付款期限",
+    ]
+    assert clauses[4].parent_path[-1].endswith("违约责任")
+
+
 def test_build_clauses_multiline_in_one_block():
     items = [
         RawItem(text="第三条\n第三条正文内容。\n第四条\n第四条正文。", kind="paragraph"),
@@ -81,6 +101,46 @@ def test_build_clauses_splits_multiline_bbox_by_line():
     assert clauses[1].blocks[0].bbox == [10, 40, 210, 60]
     assert clauses[2].blocks[0].bbox == [10, 60, 210, 80]
     assert clauses[3].blocks[0].bbox == [10, 80, 210, 100]
+
+
+def test_build_clauses_splits_inline_numbered_and_field_boundaries():
+    """原生 PDF 可能把多个逻辑起点放在同一文本行，仍需拆成独立条款。"""
+    items = [
+        RawItem(
+            text=(
+                "第一条合作内容 1.1 服务内容。1.2 支付方式。"
+                "开户行:中国工商银行 账户名:甲公司"
+            ),
+            kind="paragraph",
+            page_index=0,
+            bbox=[10, 20, 310, 60],
+        )
+    ]
+
+    clauses = build_clauses(items, "pdf")
+
+    assert [clause.number for clause in clauses[:3]] == ["一", "1.1", "1.2"]
+    assert [clause.field_key for clause in clauses[3:]] == ["开户行", "账户名"]
+    assert clauses[1].text == "服务内容。"
+    assert clauses[2].text == "支付方式。"
+
+
+def test_build_clauses_splits_spaced_chinese_number_inside_merged_block():
+    clauses = build_clauses(
+        [
+            RawItem(
+                text="乙方：(供方)湖北欧朗机械有限公司。 一 、 合同标的",
+                page_index=0,
+                bbox=[10, 10, 500, 50],
+            )
+        ],
+        "pdf",
+    )
+
+    assert [(clause.field_key, clause.number, clause.text) for clause in clauses] == [
+        ("乙方", "", "(供方)湖北欧朗机械有限公司。"),
+        ("", "一", "合同标的"),
+    ]
 
 
 def test_blocks_to_raw_maps_labels():
@@ -130,6 +190,42 @@ def test_build_clauses_preserves_unnumbered_merge():
     assert len(clauses) == 1
     assert "正文第一行" in clauses[0].text
     assert "正文第二行" in clauses[0].text
+
+
+def test_build_clauses_ignores_pdf_markdown_heading_markers():
+    """OCR Markdown 的标题语法不能变成合同正文或阻断编号识别。"""
+    items = [
+        RawItem(
+            text="# 通用两页样板合同",
+            kind="paragraph",
+            page_index=0,
+            bbox=[10, 10, 210, 30],
+        ),
+        RawItem(text="## 第一条 合作内容", kind="paragraph"),
+        RawItem(text="### 1.1 服务内容", kind="paragraph"),
+        RawItem(text="服务正文。", kind="paragraph"),
+    ]
+
+    clauses = build_clauses(items, "pdf")
+
+    assert [(clause.number, clause.title) for clause in clauses] == [
+        ("", ""),
+        ("一", "合作内容"),
+        ("1.1", "服务内容"),
+    ]
+    assert clauses[0].text == "通用两页样板合同"
+    assert clauses[2].text == "服务内容\n服务正文。"
+    # 只清理用于比较的文本；定位证据仍保留 OCR 原文及坐标。
+    assert clauses[0].blocks[0].content == "# 通用两页样板合同"
+    assert clauses[0].blocks[0].bbox == [10, 10, 210, 30]
+
+
+def test_build_clauses_does_not_strip_literal_hash_text_or_word_source():
+    pdf = build_clauses([RawItem(text="#合同编号 A-001")], "pdf")
+    word = build_clauses([RawItem(text="# 合同编号 A-001")], "word")
+
+    assert pdf[0].text == "#合同编号 A-001"
+    assert word[0].text == "# 合同编号 A-001"
 
 
 def test_contract_section_titles_anchor_numbered_and_unnumbered_versions():

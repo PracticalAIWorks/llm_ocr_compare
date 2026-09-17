@@ -1,15 +1,73 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ${DC_DB_CONTAINER_NAME:-llm-ocr-compare-db}
+    restart: unless-stopped
+    # 不暴露端口:仅 compose 内部网络供应用访问。
+    # 应用通过 postgres:5432(容器内端口 + 服务名)连接。
+    # 如需从宿主机直连 DB(调试),取消注释下面 ports,端口用 25432 避免与本机 PG 冲突。
+    ports:
+      - "${DC_DB_PORT:-15433}:5432"
+    environment:
+      POSTGRES_DB: doc_compare
+      POSTGRES_USER: dc
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dcpass}
+      TZ: Asia/Shanghai
+    volumes:
+      # 绑定宿主目录:持久化数据库文件,容器重建后数据保留。
+      - ./data/pg:/var/lib/postgresql/data
+    healthcheck:
+      # 等待 PG 就绪后再拉起应用,避免应用启动时连接失败。
+      test: [ "CMD-SHELL", "pg_isready -U dc -d doc_compare" ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   llm-ocr-compare:
     build:
       context: .
       dockerfile: Dockerfile
-    image: registry.cn-hangzhou.aliyuncs.com/chldemo/llm-ocr-compare:0.0.14
-    container_name: llm-ocr-compare
+      # 版本号在构建期烧入镜像(与 image tag 同源),保证其它机器拉镜像后无需再配 .env
+      # 即可显示正确版本。构建后镜像已自带版本,运行期不再用 .env 覆盖。
+      args:
+        DC_VERSION: ${DC_VERSION}
+    image: registry.cn-hangzhou.aliyuncs.com/chldemo/llm-ocr-compare:${DC_VERSION}
+    container_name: ${DC_APP_CONTAINER_NAME:-llm-ocr-compare}
     platform: linux/amd64
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
+      # 原地发布：应用直接持有稳定宿主端口，发布 = drain 后换镜像 tag 重建本容器。
       - "${DC_PORT:-3012}:8000"
+    environment:
+      # DATABASE_URL 内部走服务名 + 容器内端口 5432(不是宿主映射端口)。
+      DATABASE_URL: postgresql+psycopg://dc:${POSTGRES_PASSWORD:-dcpass}@postgres:5432/doc_compare
+      # 版本号已构建期烧入镜像(Dockerfile ENV DC_VERSION);此处不再注入,
+      # 避免部署机 .env 的 DC_VERSION 缺失/过期时覆盖镜像自带的正确版本。
+      # Postgres 连接池与迁移(可选透传;未设置时用代码默认:pool 5 / overflow 10 / timeout 30s / 自动迁移开)。
+      # 启用多 worker 时注意:N workers × (pool+overflow) 需 ≤ PG max_connections(默认 100)。
+      DC_DB_AUTO_MIGRATE: ${DC_DB_AUTO_MIGRATE:-1}
+      DC_DB_POOL_SIZE: ${DC_DB_POOL_SIZE:-5}
+      DC_DB_MAX_OVERFLOW: ${DC_DB_MAX_OVERFLOW:-10}
+      DC_DB_POOL_TIMEOUT: ${DC_DB_POOL_TIMEOUT:-30.0}
+      # 多 worker / 并发上限(可选透传,默认 1 worker、4 并发,与单进程行为一致)。
+      DC_UVICORN_WORKERS: ${DC_UVICORN_WORKERS:-1}
+      DC_MAX_CONCURRENT_TASKS: ${DC_MAX_CONCURRENT_TASKS:-4}
+      DC_MAX_QUEUED_TASKS: ${DC_MAX_QUEUED_TASKS:-50}
+      DC_SYNC_QUEUE_WAIT_SECONDS: ${DC_SYNC_QUEUE_WAIT_SECONDS:-300}
+      DC_TASK_QUEUE_LEASE_SECONDS: ${DC_TASK_QUEUE_LEASE_SECONDS:-120}
+      # 控制台访问口令(可选;非空时 Web 控制台需口令登录,外部 X-API-Key 接口不受影响)。
+      DC_CONSOLE_PASSWORD: ${DC_CONSOLE_PASSWORD:-}
+      DC_CONSOLE_SESSION_TTL_HOURS: ${DC_CONSOLE_SESSION_TTL_HOURS:-12}
     volumes:
-      # 绑定宿主目录:持久化数据(uploads/reports/llm_config.json)与日志(logs/app.log)
+      # 绑定宿主目录:持久化 uploads 文件与日志(logs/app.log)
+      # LLM/OCR 配置写入同栈 Postgres(llm_config 表),不再读写此卷下的 llm_config.json
       # 宿主机直接 tail -f ./data/logs/app.log 即可查看日志
       - ./data:/app/.dc_data
+      # 可选:部署方拥有授权的 Word 字体(等线、微软雅黑、宋体、Arial 等)放在
+      # DC_FONTS_DIR。只读挂载，字体不进入镜像、仓库或任务数据目录。
+      - ${DC_FONTS_DIR:-./fonts}:/usr/local/share/fonts/authorized:ro
+    # 停止旧容器时等待在途任务收尾；长任务发布建议先 drain/wait。
+    stop_grace_period: 130s

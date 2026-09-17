@@ -13,11 +13,17 @@ const props = defineProps<{
   pdfUrl?: string | null
   pageMeta: PageMeta[]
   diffs: Diff[]
+  side?: 'source' | 'target'
+  /** 双栏预览时按容器宽度缩小页面，避免窄屏退化为单栏或横向溢出。 */
+  fitToContainer?: boolean
+  /** 双栏预览共用的缩放倍率；1 表示适宽，放大后可在页面内横向滚动查看。 */
+  zoomLevel?: number
   selectedClauseId?: string | null
 }>()
 
 const emit = defineEmits<{
   selectClause: [clauseId: string]
+  'update:zoomLevel': [zoomLevel: number]
 }>()
 
 // ---- 状态 ----
@@ -30,6 +36,9 @@ const pages = ref<{
   height: number
   meta: PageMeta | null
 }[]>([])
+const viewerRoot = ref<HTMLElement | null>(null)
+let resizeObserver: ResizeObserver | null = null
+let renderedContainerWidth = 0
 
 // ---- 整理高亮区域 ----
 interface HighlightRegion {
@@ -38,18 +47,20 @@ interface HighlightRegion {
   risk: string
   pageIndex: number
   bbox: number[]   // 归一化 [x1,y1,x2,y2]
+  kind: 'real' | 'placeholder'  // placeholder=推断占位框(deleted),位置非精确
 }
 
 const allRegions = computed<HighlightRegion[]>(() =>
   props.diffs
-    .filter((d) => d.page_regions.length)
+    .filter((d) => (props.side === 'source' ? (d.source_page_regions ?? []) : d.page_regions).length)
     .flatMap((d) =>
-      d.page_regions.map((r) => ({
+      (props.side === 'source' ? (d.source_page_regions ?? []) : d.page_regions).map((r) => ({
         diffId: d.alignment_id,
         label: [d.number, d.title].filter(Boolean).join(' · ') || d.alignment_id,
         risk: d.risk_level,
         pageIndex: r.page_index,
         bbox: r.bbox,
+        kind: r.kind ?? 'real',
       })),
     ),
 )
@@ -74,6 +85,10 @@ function riskColor(level: string): string {
     default: return 'rgba(148,163,184,0.25)'
   }
 }
+
+// ---- deleted 推断占位框:虚线红框 + 极淡填充(与真实高亮区分)----
+const placeholderFill = 'rgba(220,38,38,0.10)'
+const placeholderBorder = 'rgba(220,38,38,0.85)'
 
 function riskBorder(level: string): string {
   switch (level) {
@@ -119,7 +134,18 @@ function regionIsSelected(r: HighlightRegion): boolean {
 }
 
 // ---- 放大 ----
-const zoom = ref(1.0)
+const localZoom = ref(1.0)
+const zoom = computed(() => props.zoomLevel ?? localZoom.value)
+
+function setZoom(nextZoom: number): void {
+  const boundedZoom = Math.max(0.5, Math.min(4, nextZoom))
+  if (props.zoomLevel == null) {
+    localZoom.value = boundedZoom
+    void renderPdf()
+    return
+  }
+  emit('update:zoomLevel', boundedZoom)
+}
 
 // ---- 滚动到指定页 ----
 const pageRefs = ref<Map<number, HTMLElement>>(new Map())
@@ -134,16 +160,32 @@ function scrollToPage(pageNum: number) {
   el?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
-// watch selectedClauseId → 定位到第一个匹配区域所在页
+/**
+ * 选中条款时定位到本侧首个真实或推断区域。
+ *
+ * 列表点击会先让父组件展开预览，再挂载 PdfViewer；因此不能只依赖 prop
+ * 改变时的 watcher，还要在 PDF 页面实际渲染、页面 ref 已挂载后再执行一次。
+ */
+function scrollToSelectedClause() {
+  const id = props.selectedClauseId
+    if (!id) return
+  const region = allRegions.value.find((r) => r.diffId === id)
+  if (region) scrollToPage(region.pageIndex)
+}
+
+watch(
+  () => props.zoomLevel,
+  (nextZoom, previousZoom) => {
+    if (nextZoom != null && nextZoom !== previousZoom) void renderPdf()
+  },
+)
+
 watch(
   () => props.selectedClauseId,
-  (id) => {
-    if (!id) return
-    const region = allRegions.value.find((r) => r.diffId === id)
-    if (region) {
-      nextTick(() => scrollToPage(region.pageIndex))
-    }
+  () => {
+    void nextTick(scrollToSelectedClause)
   },
+  { flush: 'post' },
 )
 
 
@@ -160,13 +202,19 @@ async function renderPdf() {
   try {
     const pdf = await pdfjsLib.getDocument({ url: props.pdfUrl, cMapUrl: undefined, cMapPacked: true }).promise
     const newPages: typeof pages.value = []
+    const availableWidth = viewerRoot.value?.clientWidth ?? 0
+    renderedContainerWidth = availableWidth
 
     for (let i = 1; i <= pdf.numPages; i++) {
       const page = await pdf.getPage(i)
       const meta = props.pageMeta?.find((m) => m.page_index === i - 1) ?? null
 
       // 使用设备像素比保证在各平台清晰且高亮对齐
-      const scale = dpr.value * zoom.value
+      const baseViewport = page.getViewport({ scale: 1 })
+      const fit = props.fitToContainer && availableWidth > 0
+        ? Math.min(1, Math.max(0.2, (availableWidth - 8) / baseViewport.width))
+        : 1
+      const scale = dpr.value * zoom.value * fit
       const viewport = page.getViewport({ scale })
       const canvas = document.createElement('canvas')
       canvas.width = viewport.width
@@ -185,6 +233,9 @@ async function renderPdf() {
     }
 
     pages.value = newPages
+    // 首次由条款列表展开预览时 selectedClauseId 已存在，等 ref 完整挂载后再跳转。
+    await nextTick()
+    scrollToSelectedClause()
   } catch (e) {
     loadError.value = `PDF 加载失败: ${(e as Error).message}`
   } finally {
@@ -199,32 +250,47 @@ function mountCanvas(canvas: HTMLCanvasElement, container: HTMLElement) {
 }
 
 watch(() => props.pdfUrl, () => { void renderPdf() })
-onMounted(() => { void renderPdf() })
+onMounted(() => {
+  if (viewerRoot.value && props.fitToContainer) {
+    resizeObserver = new ResizeObserver(([entry]) => {
+      const width = entry?.contentRect.width ?? 0
+      if (Math.abs(width - renderedContainerWidth) > 8) void renderPdf()
+    })
+    resizeObserver.observe(viewerRoot.value)
+  }
+  void renderPdf()
+})
 onBeforeUnmount(() => {
+  resizeObserver?.disconnect()
   pages.value = []
 })
 </script>
 
 <template>
-  <div class="pv">
+  <div ref="viewerRoot" class="pv">
     <div v-if="loading" class="pv-loading muted">PDF 加载中…</div>
     <p v-else-if="loadError" class="pv-err">{{ loadError }}</p>
 
     <!-- 缩放控件 -->
     <div v-if="pages.length" class="pv-toolbar">
-      <button class="chip" @click="zoom = Math.max(0.5, zoom - 0.25); renderPdf()">-</button>
+      <button class="chip" @click="setZoom(zoom - 0.25)">-</button>
       <span class="zoom-label">{{ Math.round(zoom * 100) }}%</span>
-      <button class="chip" @click="zoom = Math.min(3, zoom + 0.25); renderPdf()">+</button>
+      <button class="chip" @click="setZoom(zoom + 0.25)">+</button>
+      <button class="chip pv-fit-button" :disabled="zoom === 1" @click="setZoom(1)">适宽</button>
     </div>
 
-    <div v-if="pages.length" class="pv-pages">
-      <div
-        v-for="(p, pi) in pages"
-        :key="p.pageNum"
-        :ref="(el) => setPageRef(pi, el as Element)"
-        class="pv-page"
-        :style="{ width: `${p.width}px`, height: `${p.height}px` }"
-      >
+    <div v-if="pages.length" class="pv-pages-viewport">
+      <div class="pv-pages">
+        <div
+          v-for="(p, pi) in pages"
+          :key="p.pageNum"
+          :ref="(el) => setPageRef(pi, el as Element)"
+          class="pv-page"
+          :style="{
+            width: `${p.width}px`,
+            aspectRatio: `${p.width} / ${p.height}`,
+          }"
+        >
         <!-- canvas 层 -->
         <div class="pv-canvas-wrap" :ref="(el) => el && mountCanvas(p.canvas, el as HTMLElement)" />
 
@@ -235,13 +301,14 @@ onBeforeUnmount(() => {
             :key="r.diffId + r.bbox.join(',')"
             class="pv-highlight"
             :class="{
+              'pv-highlight--placeholder': r.kind === 'placeholder',
               'pv-highlight--selected': regionIsSelected(r),
               'pv-highlight--hover': hoveredRegion === r,
             }"
             :style="{
               ...rectFromBbox(r.bbox, p.width, p.height),
-              backgroundColor: riskColor(r.risk),
-              borderColor: riskBorder(r.risk),
+              backgroundColor: r.kind === 'placeholder' ? placeholderFill : riskColor(r.risk),
+              borderColor: r.kind === 'placeholder' ? placeholderBorder : riskBorder(r.risk),
             }"
             @click="emit('selectClause', r.diffId)"
             @mouseenter="showTooltip($event, r, pi)"
@@ -251,7 +318,8 @@ onBeforeUnmount(() => {
         </div>
 
         <!-- 页码 -->
-        <span class="pv-page-num">{{ p.pageNum }}</span>
+          <span class="pv-page-num">{{ p.pageNum }}</span>
+        </div>
       </div>
     </div>
 
@@ -300,13 +368,26 @@ onBeforeUnmount(() => {
   text-align: center;
   color: var(--text-muted);
 }
+.pv-fit-button {
+  margin-left: 4px;
+}
+.pv-pages-viewport {
+  width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-gutter: stable;
+}
 .pv-pages {
+  width: max-content;
+  min-width: 100%;
   display: flex;
   flex-direction: column;
   gap: 16px;
-  align-items: center;
+  align-items: flex-start;
 }
 .pv-page {
+  flex: 0 0 auto;
+  margin-inline: auto;
   position: relative;
   border: 1px solid var(--border);
   border-radius: 2px;
@@ -321,7 +402,7 @@ onBeforeUnmount(() => {
 .pv-canvas-wrap :deep(canvas) {
   display: block;
   width: 100%;
-  height: 100%;
+  height: auto;
 }
 .pv-overlay {
   position: absolute;
@@ -336,6 +417,9 @@ onBeforeUnmount(() => {
   cursor: pointer;
   transition: box-shadow 0.12s, background-color 0.12s;
   box-sizing: border-box;
+}
+.pv-highlight--placeholder {
+  border-style: dashed;
 }
 .pv-highlight:hover,
 .pv-highlight--hover {

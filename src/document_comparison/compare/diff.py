@@ -5,10 +5,9 @@
 from __future__ import annotations
 
 from difflib import SequenceMatcher
-import re
 
 from ..models import DiffSegment, TableStructure
-from ..structure.normalize import normalize_text
+from .elements import canonicalize_contract_text
 
 
 def char_diff(a: str, b: str) -> list[DiffSegment]:
@@ -28,10 +27,6 @@ def char_diff(a: str, b: str) -> list[DiffSegment]:
                 segs.append(DiffSegment(op="insert", text=b[j1:j2]))
     return segs
 
-
-def is_only_whitespace_or_punct(a: str, b: str) -> bool:
-    """归一化后字符是否一致(用于判格式噪声)。"""
-    return a == b
 
 
 def table_diff(a: TableStructure, b: TableStructure) -> list[DiffSegment]:
@@ -88,8 +83,9 @@ def describe_table_change(
     """返回首个确定性的表格结构/单元格差异说明。"""
     if len(word_tables) != len(pdf_tables):
         if len(word_tables) > len(pdf_tables):
-            return "PDF 缺失 DOCX 中的表格"
-        return "PDF 新增表格"
+            # word/pdf 在此仅代表 source/target 两侧,source 可为 Word 或 PDF。
+            return "回收件缺失原始合同中的表格"
+        return "回收件新增表格"
 
     for table_index, (word_table, pdf_table) in enumerate(zip(word_tables, pdf_tables)):
         if [_table_cell_key(cell) for cell in word_table.headers] != [
@@ -127,5 +123,5 @@ def describe_table_change(
 
 
 def _table_cell_key(cell: str) -> str:
-    """表格确定性比较键：忽略排版空白，保留实际文字。"""
-    return re.sub(r"\s+", "", normalize_text(cell))
+    """表格确定性比较键：与正文使用同一套安全排版归一化。"""
+    return canonicalize_contract_text(cell)

@@ -17,12 +17,40 @@ from .normalize import normalize_text
 
 _SEP = r"(?=[\s，,。：:、]|$)"
 
+# PaddleOCR-VL 的 Markdown fallback 会给标题加 ``# `` / ``## `` 等语法标记。
+# 这些是识别结果的版式元数据，不是合同正文；若直接参与编号识别，
+# ``## 第一条`` 无法与 Word 侧的 ``第一条`` 锚定，进而产生一增一删。
+# 必须要求 # 后存在空白，避免误删 ``#合同编号`` 等真实文本。
+_MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}[ \t]+")
+
+# PDF 文本层有时会把多个视觉逻辑行压成同一个 text line，例如
+# ``...3.2 支付方式...``、``开户行:...账户名:...``。这些起点必须在
+# 条款切分前恢复，否则字段/编号锚定会把多个条款错误合并。
+_INLINE_NUMBER_RE = re.compile(
+    # 合同编号通常为 1~2 位段号；限制每段长度避免把 50000.00、2026.08
+    # 等金额/日期小数误识别为新条款。
+    r"(?:(?<!\d)\d{1,2}\.\d{1,2}(?:\.\d{1,2})?[.、]?\s+|[（(][一二三四五六七八九十\d]+[)）])"
+)
+_INLINE_CN_NUMBER_RE = re.compile(
+    r"[一二三四五六七八九十]{1,3}\s*[、.．]\s*(?=\S)"
+)
+_INLINE_CHAPTER_RE = re.compile(
+    r"第[一二三四五六七八九十百千零〇\d]+(?:条|章)"
+)
+_INLINE_FIELD_RE = re.compile(
+    r"(?:统一社会信用代码(?:[/／]身份证号)?|身份证号|法定代表人|负责人|"
+    r"联系电话|联系地址|开户行|开户银行|账户名|账户名称|账号|帐号|账\s*号|"
+    r"日期|时间|签约日期|签订日期|签约代表|地址|电话|传真|邮编|邮箱|电子邮箱)\s*[:：]"
+)
+
 # —— 编号模式(顺序敏感)—— 返回 (prefix, number, level) ——
 _NUM_PATTERNS: list[tuple[re.Pattern[str], int]] = [
     (re.compile(r"^第([一二三四五六七八九十百千零〇\d]+)(?:条|章)" + _SEP), 1),
     (re.compile(r"^(\d+\.\d+(?:\.\d+)?)" + _SEP), 2),  # X.X / X.X.X
     (re.compile(r"^[（(]([一二三四五六七八九十\d]+)[)）]"), 3),
-    (re.compile(r"^([一二三四五六七八九十]+)、"), 2),
+    # Word 自动编号转纯文本后可能在中文序号与顿号间留下排版空格，
+    # 如「一 、 合同标的」。只放宽行首编号前缀，不改动原文参与差异裁决。
+    (re.compile(r"^([一二三四五六七八九十]+)\s*[、.．]\s*"), 2),
     (re.compile(r"^(\d+)[\.、]"), 2),
 ]
 
@@ -193,16 +221,109 @@ def _line_item(item: RawItem, text: str, line_index: int, line_count: int) -> Ra
 
 
 def _split_lines_with_bbox(item: RawItem, norm: str) -> list[RawItem]:
-    lines = [line.strip() for line in norm.split("\n") if line.strip()]
+    lines = _split_logical_lines(norm)
     if not lines:
         return []
     return [_line_item(item, line, idx, len(lines)) for idx, line in enumerate(lines)]
+
+
+def _split_logical_lines(norm: str) -> list[str]:
+    """按显式换行及块内编号/字段起点恢复逻辑行。
+
+    这是对 PDF 原生文本层的保守修复：只在强锚点处拆分，不按普通中文标点
+    拆正文。紧凑章标题（如 ``第一条合作内容``）只在逻辑行开头接受，避免
+    把正文中的「第一条」引用误识别为新条款。
+    """
+    logical_lines: list[str] = []
+    for raw_line in norm.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        starts = [0]
+        for match in _INLINE_NUMBER_RE.finditer(line):
+            index = match.start()
+            if index == 0:
+                continue
+            previous = line[index - 1]
+            # (2) 通常跟在分号/顿号后；数字编号要求后面有空格，避免
+            # 把金额小数或日期中的点拆开。
+            if match.group(0).startswith(("(", "（")) and not (
+                previous.isspace() or previous in "。；;、:："
+            ):
+                continue
+            starts.append(index)
+
+        for match in _INLINE_CN_NUMBER_RE.finditer(line):
+            index = match.start()
+            if index == 0:
+                continue
+            previous = line[index - 1]
+            if not (previous.isspace() or previous in "。；;、:："):
+                continue
+            starts.append(index)
+
+        for match in _INLINE_FIELD_RE.finditer(line):
+            if match.start() > 0:
+                starts.append(match.start())
+
+        # 紧凑中文章标题可能没有空格，但只接受行首或标点后的起点。
+        for match in _INLINE_CHAPTER_RE.finditer(line):
+            index = match.start()
+            if index == 0:
+                starts.append(index)
+            elif line[index - 1] in "。；;、:：":
+                starts.append(index)
+
+        starts = sorted(set(starts))
+        for start, end in zip(starts, [*starts[1:], len(line)]):
+            part = line[start:end].strip()
+            if not part:
+                continue
+            # 仅对条款行首的紧凑章节补一个解析用分隔符；输出正文仍不含该空格。
+            chapter = _INLINE_CHAPTER_RE.match(part)
+            compact_body = part[chapter.end():].lstrip() if chapter else ""
+            if (
+                chapter
+                and chapter.end() < len(part)
+                and not part[chapter.end()].isspace()
+                and _looks_like_compact_chapter_heading(compact_body)
+            ):
+                part = f"{part[:chapter.end()]} {part[chapter.end():]}"
+            logical_lines.append(part)
+    return logical_lines
+
+
+def _looks_like_compact_chapter_heading(body: str) -> bool:
+    """判断无分隔符章标题，避免把「第三条正文内容。」当作新编号。"""
+    if not body or len(body) > 20:
+        return False
+    return not any(char in body for char in "，,。；;:：、!?！？")
 
 
 def _split_body(line: str, prefix: str) -> str:
     """用编号前缀长度切片,去掉编号后清理分隔符。"""
     rest = line[len(prefix):]
     return rest.lstrip(" .、．)）:：").strip()
+
+
+def _comparison_text(text: str, doc_type: DocType) -> str:
+    """返回结构识别使用的文本，不改动 Word 原文或 OCR 定位证据。"""
+    if doc_type != "pdf":
+        return text
+    return _MARKDOWN_HEADING_RE.sub("", text, count=1)
+
+
+def _raw_evidence_item(item: RawItem, text: str) -> RawItem:
+    """为已清理的单行比较文本恢复 OCR 原文，同时保留其定位信息。"""
+    return RawItem(
+        text=text,
+        kind=item.kind,
+        heading_level=item.heading_level,
+        page_index=item.page_index,
+        bbox=list(item.bbox),
+        table=item.table,
+    )
 
 
 def build_clauses(raw_items: list[RawItem], doc_type: DocType) -> list[Clause]:
@@ -215,21 +336,35 @@ def build_clauses(raw_items: list[RawItem], doc_type: DocType) -> list[Clause]:
     clauses: list[Clause] = []
     current: Clause | None = None
     counter = 0
+    hierarchy: dict[int, str] = {}
 
     def new_clause(number, level, title, text, item: RawItem, field_key: str = "") -> Clause:
         nonlocal counter
         counter += 1
         blocks = [_raw_to_block(item)] if item.bbox else []
-        return Clause(
+        parent_path = [
+            hierarchy[parent_level]
+            for parent_level in sorted(hierarchy)
+            if level <= 0 or parent_level < level
+        ]
+        clause = Clause(
             clause_id=f"{doc_type}-{counter}",
             doc_type=doc_type,
             level=level,
             number=number,
             title=title,
             text=text,
+            source_page_index=item.page_index if doc_type == "word" else None,
             blocks=blocks,
             field_key=field_key,
+            parent_path=parent_path,
         )
+        if level > 0:
+            for child_level in [value for value in hierarchy if value >= level]:
+                hierarchy.pop(child_level, None)
+            label = " ".join(value for value in (number, title) if value).strip()
+            hierarchy[level] = label or text[:80]
+        return clause
 
     for item in raw_items:
         norm = normalize_text(item.text)
@@ -260,19 +395,24 @@ def build_clauses(raw_items: list[RawItem], doc_type: DocType) -> list[Clause]:
             continue
 
         if item.kind in ("heading", "title"):
-            num = detect_number(norm)
+            comparison_norm = _comparison_text(norm, doc_type)
+            num = detect_number(comparison_norm)
             if num:
                 prefix, number, level = num
-                body = _split_body(norm, prefix)
+                body = _split_body(comparison_norm, prefix)
                 section = detect_section_key(body)
                 current = new_clause(
-                    number, level, body or norm, body or norm, item,
+                    number,
+                    level,
+                    body or comparison_norm,
+                    body or comparison_norm,
+                    item,
                     section[1] if section else "",
                 )
             else:
-                section = detect_section_key(norm)
+                section = detect_section_key(comparison_norm)
                 current = new_clause(
-                    "", item.heading_level or 1, norm, norm, item,
+                    "", item.heading_level or 1, comparison_norm, comparison_norm, item,
                     section[1] if section else "",
                 )
             clauses.append(current)
@@ -280,15 +420,20 @@ def build_clauses(raw_items: list[RawItem], doc_type: DocType) -> list[Clause]:
 
         # paragraph:按行拆分(单个 block 可能含多行/多编号/多字段)
         # 优先级:编号 > 字段名 > 续入当前条款
-        for line_item in _split_lines_with_bbox(item, norm):
+        comparison_norm = _comparison_text(norm, doc_type)
+        line_items = _split_lines_with_bbox(item, comparison_norm)
+        for line_item in line_items:
             line = line_item.text
+            evidence_item = line_item
+            if comparison_norm != norm and len(line_items) == 1:
+                evidence_item = _raw_evidence_item(line_item, norm)
             num = detect_number(line)
             if num:
                 prefix, number, level = num
                 body = _split_body(line, prefix)
                 section = detect_section_key(body)
                 current = new_clause(
-                    number, level, body, body, line_item,
+                    number, level, body, body, evidence_item,
                     section[1] if section else "",
                 )
                 clauses.append(current)
@@ -299,23 +444,25 @@ def build_clauses(raw_items: list[RawItem], doc_type: DocType) -> list[Clause]:
                 prefix, field_key = field
                 body = _split_body(line, prefix)
                 # 字段块:正文为冒号后的值,标题用归一化 field_key 便于阅读
-                current = new_clause("", 0, field_key, body or line, line_item, field_key)
+                current = new_clause(
+                    "", 0, field_key, body or line, evidence_item, field_key
+                )
                 clauses.append(current)
                 continue
             section = detect_section_key(line)
             if section:
                 title, field_key = section
-                current = new_clause("", 1, title, line, line_item, field_key)
+                current = new_clause("", 1, title, line, evidence_item, field_key)
                 clauses.append(current)
                 continue
             if current is None:
-                current = new_clause("", 0, "", line, line_item)
+                current = new_clause("", 0, "", line, evidence_item)
                 clauses.append(current)
             else:
                 sep = "\n" if current.text else ""
                 current.text += sep + line
-                if line_item.bbox:
-                    current.blocks.append(_raw_to_block(line_item))
+                if evidence_item.bbox:
+                    current.blocks.append(_raw_to_block(evidence_item))
 
     return clauses
 

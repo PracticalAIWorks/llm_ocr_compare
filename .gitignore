@@ -9,7 +9,9 @@ dist/
 data/
 .venv/
 venv/
+test/
 .env
+deploy/*.env
 .pytest_cache/
 .coverage
 htmlcov/
@@ -17,3 +19,7 @@ htmlcov/
 *.docx
 !tests/fixtures/*
 .zcode/
+.DS_Store
+.playwright-mcp
+
+tests/*

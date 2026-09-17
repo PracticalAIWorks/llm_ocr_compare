@@ -55,6 +55,12 @@ class TrustedPDFReader:
             fallback_pages = self._recognize_fallback_pages(
                 pdf_path, fallback_indexes, on_progress=on_progress
             )
+            truncated_fallback_pages = set(
+                getattr(self.fallback, "last_truncated_pages", set())
+            )
+            seal_diagnostics = dict(
+                getattr(self.fallback, "last_seal_diagnostics", {}) or {}
+            )
             for local_index, original_index in enumerate(fallback_indexes):
                 remapped = [
                     block.model_copy(
@@ -66,9 +72,38 @@ class TrustedPDFReader:
                     for block_index, block in enumerate(fallback_pages[local_index])
                 ]
                 pages[original_index] = remapped
-                diagnostics[original_index] = assess_fallback_page(
+                diagnostic = assess_fallback_page(
                     remapped, original_index
                 )
+                seal_diagnostic = seal_diagnostics.get(local_index)
+                if seal_diagnostic is not None:
+                    diagnostic = diagnostic.model_copy(
+                        update={
+                            "reliable": (
+                                diagnostic.reliable
+                                and bool(seal_diagnostic.reliable)
+                            ),
+                            "reasons": list(
+                                dict.fromkeys(
+                                    [
+                                        *diagnostic.reasons,
+                                        *seal_diagnostic.reasons,
+                                    ]
+                                )
+                            ),
+                        }
+                    )
+                if local_index in truncated_fallback_pages:
+                    diagnostic = diagnostic.model_copy(
+                        update={
+                            "reliable": False,
+                            "reasons": [
+                                *diagnostic.reasons,
+                                "OCR 模型输出达到输出上限，页面尾部可能缺失",
+                            ],
+                        }
+                    )
+                diagnostics[original_index] = diagnostic
 
         self.last_diagnostics = [
             item
@@ -117,6 +152,18 @@ def assess_fallback_page(
     reasons: list[str] = []
     content = "\n".join(block.content for block in blocks if block.content)
     char_count = len(re.sub(r"\s+", "", content))
+    located_chars = sum(
+        len(re.sub(r"\s+", "", block.content))
+        for block in blocks
+        if block.content and len(block.bbox) >= 4
+    )
+    bbox_coverage = located_chars / char_count if char_count else 0.0
+    if bbox_coverage >= 0.95:
+        location_status = "complete"
+    elif bbox_coverage > 0:
+        location_status = "partial"
+    else:
+        location_status = "missing"
     tables = [block.table for block in blocks if block.table is not None]
     if char_count < 8:
         reasons.append("OCR 返回内容为空或字符过少")
@@ -152,5 +199,6 @@ def assess_fallback_page(
         reasons=list(dict.fromkeys(reasons)),
         char_count=char_count,
         table_count=len(tables),
+        location_status=location_status,
+        bbox_coverage=bbox_coverage,
     )
-

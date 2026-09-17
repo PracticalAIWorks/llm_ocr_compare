@@ -1,11 +1,22 @@
 """比对与风险分级测试。"""
+from document_comparison.compare.adjudication import adjudicate_clause_pair
 from document_comparison.compare.diff import char_diff, describe_table_change
 from document_comparison.compare.elements import (
+    canonicalize_contract_text,
     elements_changed,
     extract_key_elements,
+    reviewable_formatting_change,
 )
 from document_comparison.compare.risk import classify_diff, max_risk
-from document_comparison.models import Alignment, Clause, KeyElement, TableStructure
+from document_comparison.models import (
+    Alignment,
+    Block,
+    Clause,
+    KeyElement,
+    PageMeta,
+    TableStructure,
+    TamperReport,
+)
 from document_comparison.report.builder import _unmatched_risk, build_report
 
 
@@ -60,6 +71,79 @@ def test_classify_semantic_drop_is_medium():
     assert status == "modified" and risk == "medium"
 
 
+def test_high_similarity_text_change_is_never_identical():
+    """零容忍策略下，语义再相近也不能抹掉已确认字符变化。"""
+    status, risk, _ = classify_diff(
+        word_text="甲方承担全部责任",
+        pdf_text="乙方承担全部责任",
+        similarity=0.9999,
+        key_elements=[],
+        sim_identical=0.98,
+        sim_modified=0.85,
+    )
+    assert status == "modified"
+    assert risk == "low"
+
+
+def test_canonical_contract_facts_remove_representation_only_differences():
+    """金额千分位和日期书写形式不同，但 canonical value 相同。"""
+    word = "合同金额100000元，交付日为2026-07-01。"
+    pdf = "合同金额100,000.00元，交付日为2026年7月1日。"
+
+    assert canonicalize_contract_text(word) == canonicalize_contract_text(pdf)
+    changed = elements_changed(extract_key_elements(word), extract_key_elements(pdf))
+    assert not any(element.changed for element in changed)
+
+
+def test_canonical_contract_text_removes_safe_cjk_spacing_and_quote_styles():
+    """中文 OCR 字间空格、标点旁空格和弯直引号只是安全排版差异。"""
+    word = '甲方：“按期交付货物”。'
+    pdf = '甲 方 : "按期交付货物"。'
+
+    assert canonicalize_contract_text(word) == canonicalize_contract_text(pdf)
+
+
+def test_canonical_contract_text_preserves_english_word_boundaries():
+    """英文单词边界可能改变含义，不能沿用“删除全部空格”的旧规则。"""
+    assert canonicalize_contract_text("force majeure") != canonicalize_contract_text(
+        "forcemajeure"
+    )
+    assert reviewable_formatting_change("force majeure", "forcemajeure") == "spacing"
+
+
+def test_canonical_amount_accepts_ocr_grouping_spaces():
+    assert canonicalize_contract_text("金额100 000.00元") == canonicalize_contract_text(
+        "金额100000元"
+    )
+
+
+def test_canonical_identifier_accepts_ocr_character_spacing():
+    assert canonicalize_contract_text(
+        "合同编号: Q G S C 2 6 0 7 0 8 0 0 1 0"
+    ) == canonicalize_contract_text("合同编号:QGSC2607080010")
+
+
+def test_account_extraction_tolerates_ocr_cjk_spacing():
+    """OCR 在多字关键词中间插空格(账 号)不能让账号要素失配而误报高风险变更。
+
+    回归:此前 PDF 侧因 "账 号" 抽不到 account,与 Word 侧集合不同,
+    被判 "高风险要素变更:account, account"。
+    """
+    word = "XX市恒信商贸有限公司账号:6222081001008899776"
+    pdf = "XX市恒信商贸有限公司账 号:6222081001008899776"
+
+    assert extract_key_elements(pdf).get("account") == ["6222081001008899776"]
+    assert canonicalize_contract_text(word) == canonicalize_contract_text(pdf)
+    changed = elements_changed(extract_key_elements(word), extract_key_elements(pdf))
+    assert not any(e.kind == "account" and e.changed for e in changed)
+
+
+def test_reviewable_punctuation_does_not_include_structural_numeric_marks():
+    assert reviewable_formatting_change("本条有效。", "本条有效") == "punctuation"
+    assert reviewable_formatting_change("第1.1条", "第11条") is None
+    assert reviewable_formatting_change("违约金为-5%", "违约金为5%") is None
+
+
 def test_max_risk():
     assert max_risk(["low", "high", "medium"]) == "high"
     assert max_risk([]) == "none"
@@ -88,6 +172,82 @@ def test_unmatched_plain_clause_is_low_risk():
     assert risk == "low"
 
 
+def test_group_alignment_report_compares_all_text_and_highlights_changed_region():
+    """1↔2 对齐比较全部文本，但只标实际变化所在的 PDF 块。"""
+    word = Clause(
+        clause_id="w1",
+        doc_type="word",
+        text="交付后付款。验收合格后30日内结清。",
+    )
+    pdf_first = Clause(
+        clause_id="p1",
+        doc_type="pdf",
+        text="交付后付款。",
+        blocks=[
+            Block(
+                block_id="b1",
+                page_index=0,
+                label="text",
+                bbox=[10, 10, 100, 30],
+                content="交付后付款。",
+            )
+        ],
+    )
+    pdf_second = Clause(
+        clause_id="p2",
+        doc_type="pdf",
+        text="验收合格后31日内结清。",
+        blocks=[
+            Block(
+                block_id="b2",
+                page_index=0,
+                label="text",
+                bbox=[10, 40, 120, 60],
+                content="验收合格后31日内结清。",
+            )
+        ],
+    )
+
+    report = build_report(
+        alignments=[
+            Alignment(
+                word_clause_ids=["w1"],
+                pdf_clause_ids=["p1", "p2"],
+                match_type="semantic",
+                similarity=0.96,
+            )
+        ],
+        word_by={"w1": word},
+        pdf_by={"p1": pdf_first, "p2": pdf_second},
+        embed=_TextAwareEmbedding(),
+        page_metas=[
+            PageMeta(
+                page_index=0,
+                width_px=200,
+                height_px=200,
+                pdf_width_pt=200,
+                pdf_height_pt=200,
+            )
+        ],
+        thresholds={"identical": 0.98, "modified": 0.85},
+        source="source.docx",
+        target="target.pdf",
+    )
+
+    assert report.change_status == "changed"
+    assert len(report.diffs) == 1
+    assert any(
+        segment.op == "delete" and "0" in segment.text
+        for segment in report.diffs[0].segments
+    )
+    assert any(
+        segment.op == "insert" and "1" in segment.text
+        for segment in report.diffs[0].segments
+    )
+    assert len(report.diffs[0].page_regions) == 1
+    assert report.diffs[0].page_regions[0].bbox == [0.05, 0.2, 0.6, 0.3]
+
+
 class _AlmostIdenticalEmbedding:
     """模拟长表只缺一个普通文本时，整条语义相似度仍高于 identical 阈值。"""
 
@@ -96,6 +256,329 @@ class _AlmostIdenticalEmbedding:
 
     def similarity(self, _left, _right):
         return 0.995
+
+
+class _TextAwareEmbedding:
+    def embed_batch(self, texts):
+        return texts
+
+    def similarity(self, left, right):
+        return 1.0 if left == right else 0.5
+
+
+def test_safe_spacing_and_quote_styles_do_not_enter_diff_report():
+    decision = adjudicate_clause_pair(
+        Clause(clause_id="w", doc_type="word", text='甲方：“按期交付”。'),
+        Clause(clause_id="p", doc_type="pdf", text='甲 方 : "按期交付"。'),
+        similarity=0.99,
+        sim_identical=0.98,
+        sim_modified=0.85,
+    )
+
+    assert decision.status == "identical"
+    assert decision.verdict == "clean"
+
+
+def test_missing_sentence_punctuation_is_review_not_clean_or_confirmed_change():
+    decision = adjudicate_clause_pair(
+        Clause(clause_id="w", doc_type="word", text="甲方应按期交付。"),
+        Clause(clause_id="p", doc_type="pdf", text="甲方应按期交付"),
+        similarity=0.99,
+        sim_identical=0.98,
+        sim_modified=0.85,
+    )
+
+    assert decision.status == "modified"
+    assert decision.verdict == "needs_review"
+    assert decision.confidence == "low"
+    assert any("标点" in reason for reason in decision.reasons)
+
+
+def test_unsafe_english_spacing_is_review_not_clean():
+    decision = adjudicate_clause_pair(
+        Clause(clause_id="w", doc_type="word", text="force majeure"),
+        Clause(clause_id="p", doc_type="pdf", text="forcemajeure"),
+        similarity=0.99,
+        sim_identical=0.98,
+        sim_modified=0.85,
+    )
+
+    assert decision.status == "modified"
+    assert decision.verdict == "needs_review"
+    assert any("空格" in reason for reason in decision.reasons)
+
+
+def test_structural_numeric_punctuation_remains_confirmed_change():
+    decision = adjudicate_clause_pair(
+        Clause(clause_id="w", doc_type="word", text="第1.1条"),
+        Clause(clause_id="p", doc_type="pdf", text="第11条"),
+        similarity=0.99,
+        sim_identical=0.98,
+        sim_modified=0.85,
+    )
+
+    assert decision.status == "modified"
+    assert decision.verdict == "changed"
+
+
+def test_segmentation_artifact_trailing_signature_is_review():
+    """PDF 抽取把签章/公司名粘到条款末尾 → 降为待复核，不判确证变化。
+
+    用户实际场景：条款 3.1 金额条款正文完全一致，但 PDF 侧末尾多出
+    「XX市恒信商贸有限公司」落款，此前被判 modified/changed。
+    """
+    body = "本合同合作总费用为人民币(大写)人民币伍万元整(¥50000.00元),该费用包含完成本合同约定全部服务/产品的所有成本、人工、物料、税费等全部费用,无其他隐形费用。"
+    decision = adjudicate_clause_pair(
+        Clause(clause_id="w", doc_type="word", number="3.1", text=body),
+        Clause(clause_id="p", doc_type="pdf", number="3.1", text=body + "XX市恒信商贸有限公司"),
+        similarity=0.99,
+        sim_identical=0.98,
+        sim_modified=0.85,
+    )
+
+    assert decision.status == "modified"
+    assert decision.verdict == "needs_review"
+    assert decision.confidence == "low"
+    assert any("切分" in reason or "粘连" in reason for reason in decision.reasons)
+
+
+def test_segmentation_artifact_symmetric_word_side_trailing():
+    """Word 侧多出尾段（切分多切）也应降级。"""
+    body = "甲方应按期交付全部货物并保证质量合格。"
+    decision = adjudicate_clause_pair(
+        Clause(clause_id="w", doc_type="word", number="1", text=body + "乙方"),
+        Clause(clause_id="p", doc_type="pdf", number="1", text=body),
+        similarity=0.99,
+        sim_identical=0.98,
+        sim_modified=0.85,
+    )
+
+    assert decision.verdict == "needs_review"
+    assert decision.confidence == "low"
+
+
+def test_segmentation_artifact_large_tail_remains_confirmed_change():
+    """尾段占比超过阈值 → 视为实质新增内容，仍判确证变化。"""
+    decision = adjudicate_clause_pair(
+        Clause(clause_id="w", doc_type="word", number="1", text="甲方应付款。"),
+        Clause(
+            clause_id="p", doc_type="pdf", number="1",
+            text="甲方应付款。乙方应在三日内完成验收并签署确认书，否则视为验收合格。",
+        ),
+        similarity=0.6,
+        sim_identical=0.98,
+        sim_modified=0.85,
+    )
+
+    assert decision.verdict == "changed"
+
+
+def test_segmentation_artifact_with_table_change_remains_confirmed():
+    """存在表格结构差异时不降级，避免掩盖真实表格增删。"""
+    from document_comparison.models import TableStructure
+
+    word_table = TableStructure(headers=["项"], rows=[["原值"]])
+    pdf_table = TableStructure(headers=["项"], rows=[["新值"]])
+    body = "付款信息如下表所示。"
+    decision = adjudicate_clause_pair(
+        Clause(clause_id="w", doc_type="word", number="1", text=body, tables=[word_table]),
+        Clause(
+            clause_id="p", doc_type="pdf", number="1",
+            text=body + "XX市恒信商贸有限公司", tables=[pdf_table],
+        ),
+        similarity=0.99,
+        sim_identical=0.98,
+        sim_modified=0.85,
+    )
+
+    # 表格单元格变化优先，不因尾段粘连降级
+    assert decision.verdict == "changed"
+
+
+def test_table_spacing_only_change_is_review_not_confirmed_change():
+    decision = adjudicate_clause_pair(
+        Clause(
+            clause_id="w",
+            doc_type="word",
+            text="付款信息",
+            tables=[TableStructure(headers=["条款"], rows=[["force majeure"]])],
+        ),
+        Clause(
+            clause_id="p",
+            doc_type="pdf",
+            text="付款信息",
+            tables=[TableStructure(headers=["条款"], rows=[["forcemajeure"]])],
+        ),
+        similarity=0.99,
+        sim_identical=0.98,
+        sim_modified=0.85,
+    )
+
+    assert decision.status == "modified"
+    assert decision.verdict == "needs_review"
+    assert any("空格" in reason for reason in decision.reasons)
+
+
+def test_field_anchor_recomputes_company_name_similarity():
+    """field=甲方只负责配对；公司名称正文变化仍必须进入差异报告。"""
+    word_clause = Clause(
+        clause_id="word-1",
+        doc_type="word",
+        field_key="甲方",
+        text="武汉高外股份有限公司",
+    )
+    pdf_clause = Clause(
+        clause_id="pdf-1",
+        doc_type="pdf",
+        field_key="甲方",
+        text="武汉高德红外股份有限公司",
+    )
+
+    report = build_report(
+        alignments=[Alignment(
+            word_clause_id="word-1",
+            pdf_clause_id="pdf-1",
+            match_type="field",
+            similarity=1.0,
+        )],
+        word_by={"word-1": word_clause},
+        pdf_by={"pdf-1": pdf_clause},
+        embed=_TextAwareEmbedding(),
+        page_metas=[],
+        thresholds={"identical": 0.98, "modified": 0.85},
+        source="source.docx",
+        target="target.pdf",
+        enable_risk_assessment=True,
+    )
+
+    assert len(report.diffs) == 1
+    assert report.diffs[0].status == "modified"
+    assert any(segment.op == "insert" and "德红" in segment.text
+               for segment in report.diffs[0].segments)
+
+
+def test_long_clause_actor_change_survives_near_identical_similarity():
+    """长条款中的甲乙方互换不能被整条余弦相似度稀释。"""
+    prefix = "双方应遵循诚实信用原则并按合同约定履行各项义务。" * 12
+    word_clause = Clause(
+        clause_id="word-1",
+        doc_type="word",
+        number="1",
+        text=prefix + "如发生违约，甲方承担全部违约责任。",
+    )
+    pdf_clause = Clause(
+        clause_id="pdf-1",
+        doc_type="pdf",
+        number="1",
+        text=prefix + "如发生违约，乙方承担全部违约责任。",
+    )
+
+    report = build_report(
+        alignments=[Alignment(
+            word_clause_id="word-1",
+            pdf_clause_id="pdf-1",
+            match_type="number",
+            similarity=1.0,
+        )],
+        word_by={"word-1": word_clause},
+        pdf_by={"pdf-1": pdf_clause},
+        embed=_AlmostIdenticalEmbedding(),
+        page_metas=[],
+        thresholds={"identical": 0.98, "modified": 0.85},
+        source="source.docx",
+        target="target.pdf",
+        enable_risk_assessment=True,
+    )
+
+    assert report.change_status == "changed"
+    assert len(report.diffs) == 1
+    assert report.diffs[0].verdict == "changed"
+    assert report.diffs[0].risk_level == "high"
+    assert any(element.kind == "party" for element in report.key_elements)
+
+
+def test_ocr_confusable_critical_value_is_review_not_clean():
+    """0→O 可能是 OCR 噪声，但在图像复核前绝不能判 clean。"""
+    word_clause = Clause(
+        clause_id="word-1", doc_type="word", number="1", text="合同金额为100万元。"
+    )
+    pdf_clause = Clause(
+        clause_id="pdf-1", doc_type="pdf", number="1", text="合同金额为1OO万元。"
+    )
+    report = build_report(
+        alignments=[Alignment(
+            word_clause_id="word-1",
+            pdf_clause_id="pdf-1",
+            match_type="number",
+            similarity=1.0,
+        )],
+        word_by={"word-1": word_clause},
+        pdf_by={"pdf-1": pdf_clause},
+        embed=_TextAwareEmbedding(),
+        page_metas=[],
+        thresholds={"identical": 0.98, "modified": 0.85},
+        source="source.docx",
+        target="target.pdf",
+        enable_risk_assessment=True,
+    )
+
+    assert report.change_status == "needs_review"
+    assert report.diffs[0].verdict == "needs_review"
+    assert report.diffs[0].confidence == "low"
+    assert report.diffs[0].risk_level == "high"
+
+
+def test_llm_judge_cannot_downgrade_confirmed_change(monkeypatch):
+    """LLM 只能提供建议，不能把确定性金额变化降为 none。"""
+    monkeypatch.setattr(
+        "document_comparison.report.builder.llm_judge_diff",
+        lambda *_args, **_kwargs: ("none", ["LLM 认为可能是 OCR 噪声"]),
+    )
+    word_clause = Clause(
+        clause_id="word-1", doc_type="word", number="1", text="金额100万元"
+    )
+    pdf_clause = Clause(
+        clause_id="pdf-1", doc_type="pdf", number="1", text="金额200万元"
+    )
+    report = build_report(
+        alignments=[Alignment(
+            word_clause_id="word-1",
+            pdf_clause_id="pdf-1",
+            match_type="number",
+            similarity=1.0,
+        )],
+        word_by={"word-1": word_clause},
+        pdf_by={"pdf-1": pdf_clause},
+        embed=_TextAwareEmbedding(),
+        page_metas=[],
+        thresholds={"identical": 0.98, "modified": 0.85},
+        source="source.docx",
+        target="target.pdf",
+        enable_risk_assessment=True,
+        enable_llm_judge=True,
+    )
+
+    assert report.change_status == "changed"
+    assert report.overall_risk == "high"
+    assert report.diffs[0].risk_level == "high"
+
+
+def test_legacy_report_infers_change_status_from_existing_diffs():
+    """升级前保存的 JSON 没有新字段，重新加载时不能错误显示 clean。"""
+    report = TamperReport.model_validate({
+        "source": "source.docx",
+        "target": "target.pdf",
+        "overall_risk": "medium",
+        "diffs": [{
+            "alignment_id": "al1",
+            "status": "modified",
+            "risk_level": "medium",
+        }],
+    })
+
+    assert report.change_status == "changed"
+    assert report.diffs[0].verdict == "changed"
+    assert report.diffs[0].confidence == "high"
 
 
 def _table_text(table: TableStructure) -> str:
@@ -141,6 +624,7 @@ def test_missing_non_key_table_cell_is_reported_even_when_similarity_is_high():
         thresholds={"identical": 0.98, "modified": 0.85},
         source="source.docx",
         target="target.pdf",
+        enable_risk_assessment=True,
     )
 
     assert report.overall_risk == "medium"
@@ -203,6 +687,7 @@ def test_unmatched_adjacent_fragment_already_covered_by_paired_pdf_is_suppressed
         thresholds={"identical": 0.98, "modified": 0.85},
         source="source.docx",
         target="target.pdf",
+        enable_risk_assessment=True,
     )
 
     assert report.unmatched_clauses == []
@@ -228,6 +713,7 @@ def test_real_unmatched_clause_keeps_its_actual_text_in_report():
         thresholds={"identical": 0.98, "modified": 0.85},
         source="source.docx",
         target="target.pdf",
+        enable_risk_assessment=True,
     )
 
     assert len(report.unmatched_clauses) == 1
@@ -235,3 +721,449 @@ def test_real_unmatched_clause_keeps_its_actual_text_in_report():
         segment.op == "delete" and segment.text == missing_text
         for segment in report.unmatched_clauses[0].segments
     )
+
+
+# ---- deleted 推断占位框:回收件缺失条款在高亮图上的位置推断 ----
+
+
+def _pdf_clause_with_bbox(clause_id, text, y1, y2, page=0, x1=72, x2=520):
+    """构造一个带 bbox 的 PDF clause(模拟 OCR 输出)。"""
+    from document_comparison.models import Block
+
+    return Clause(
+        clause_id=clause_id,
+        doc_type="pdf",
+        text=text,
+        blocks=[Block(
+            block_id=f"{clause_id}-b", page_index=page, label="text",
+            bbox=[x1, y1, x2, y2], content=text,
+        )],
+    )
+
+
+def _page_meta(page=0, w_pt=595, h_pt=842):
+    from document_comparison.models import PageMeta
+
+    return PageMeta(
+        page_index=page, width_px=w_pt * 2, height_px=h_pt * 2,
+        pdf_width_pt=w_pt, pdf_height_pt=h_pt,
+    )
+
+
+def test_deleted_clause_with_adjacent_paired_neighbors_gets_placeholder_region():
+    """deleted 前后都有已配对 PDF 邻居(带 bbox)→ 在邻居间隙生成一个 placeholder region。"""
+    word_pre = Clause(clause_id="w1", doc_type="word", text="第一条 付款。")
+    word_missing = Clause(clause_id="w2", doc_type="word", text="第二条 验收。", number="第二条")
+    word_post = Clause(clause_id="w3", doc_type="word", text="第三条 违约。")
+    pdf_pre = _pdf_clause_with_bbox("p1", "第一条 付款。", y1=72, y2=100)
+    pdf_post = _pdf_clause_with_bbox("p3", "第三条 违约。", y1=160, y2=190)
+
+    report = build_report(
+        alignments=[
+            Alignment(word_clause_id="w1", pdf_clause_id="p1", match_type="semantic", similarity=0.9),
+            Alignment(word_clause_id="w2", pdf_clause_id=None, match_type="unmatched", similarity=0.0),
+            Alignment(word_clause_id="w3", pdf_clause_id="p3", match_type="semantic", similarity=0.9),
+        ],
+        word_by={"w1": word_pre, "w2": word_missing, "w3": word_post},
+        pdf_by={"p1": pdf_pre, "p3": pdf_post},
+        embed=_AlmostIdenticalEmbedding(),
+        page_metas=[_page_meta()],
+        thresholds={"identical": 0.98, "modified": 0.85},
+        source="source.docx",
+        target="target.pdf",
+    )
+
+    deleted = [d for d in report.unmatched_clauses if d.status == "deleted"]
+    assert len(deleted) == 1
+    regions = deleted[0].page_regions
+    assert len(regions) == 1
+    r = regions[0]
+    assert r.kind == "placeholder"
+    assert r.page_index == 0
+    # 占位框 top 应 >= 前邻居底部(100/842),bottom 应 <= 后邻居顶部(160/842)
+    assert r.bbox[1] >= 100 / 842 - 0.01
+    assert r.bbox[3] <= 160 / 842 + 0.01
+
+
+def test_deleted_clause_only_pre_neighbor_placeholder_below_it():
+    """仅前向已配对邻居时,占位框贴在前邻居下方同页。"""
+    word_pre = Clause(clause_id="w1", doc_type="word", text="第一条 付款。")
+    word_missing = Clause(clause_id="w2", doc_type="word", text="第二条 验收。", number="第二条")
+    pdf_pre = _pdf_clause_with_bbox("p1", "第一条 付款。", y1=72, y2=100)
+
+    report = build_report(
+        alignments=[
+            Alignment(word_clause_id="w1", pdf_clause_id="p1", match_type="semantic", similarity=0.9),
+            Alignment(word_clause_id="w2", pdf_clause_id=None, match_type="unmatched", similarity=0.0),
+        ],
+        word_by={"w1": word_pre, "w2": word_missing},
+        pdf_by={"p1": pdf_pre},
+        embed=_AlmostIdenticalEmbedding(),
+        page_metas=[_page_meta()],
+        thresholds={"identical": 0.98, "modified": 0.85},
+        source="source.docx",
+        target="target.pdf",
+    )
+
+    deleted = [d for d in report.unmatched_clauses if d.status == "deleted"]
+    assert len(deleted) == 1
+    regions = deleted[0].page_regions
+    assert len(regions) == 1
+    assert regions[0].kind == "placeholder"
+    # 占位框 top 应在前邻居底部(100/842)下方
+    assert regions[0].bbox[1] > 100 / 842 - 0.01
+
+
+def test_deleted_clause_cross_page_uses_word_page_hint_not_earlier_anchor():
+    """第十条跨页时，10.4 删除不能被无条件推到前一页。"""
+    word_pre = Clause(clause_id="w1", doc_type="word", text="第十条 其他约定。")
+    word_missing = Clause(
+        clause_id="w2",
+        doc_type="word",
+        number="10.4",
+        text="测试条款1232456767",
+        source_page_index=3,
+    )
+    word_post = Clause(clause_id="w3", doc_type="word", text="第十一条 附则。")
+    pdf_pre = _pdf_clause_with_bbox("p1", "第十条 其他约定。", page=1, y1=720, y2=750)
+    pdf_post = _pdf_clause_with_bbox("p3", "第十一条 附则。", page=3, y1=220, y2=250)
+
+    report = build_report(
+        alignments=[
+            Alignment(word_clause_id="w1", pdf_clause_id="p1", match_type="number", similarity=1.0),
+            Alignment(word_clause_id="w2", pdf_clause_id=None, match_type="unmatched", similarity=0.0),
+            Alignment(word_clause_id="w3", pdf_clause_id="p3", match_type="number", similarity=1.0),
+        ],
+        word_by={"w1": word_pre, "w2": word_missing, "w3": word_post},
+        pdf_by={"p1": pdf_pre, "p3": pdf_post},
+        embed=_AlmostIdenticalEmbedding(),
+        page_metas=[_page_meta(page=index) for index in range(4)],
+        thresholds={"identical": 0.98, "modified": 0.85},
+        source="source.docx",
+        target="target.pdf",
+    )
+
+    deleted = [d for d in report.unmatched_clauses if d.status == "deleted"]
+    assert len(deleted) == 1
+    assert deleted[0].page_regions[0].page_index == 3
+    assert deleted[0].page_regions[0].bbox[3] <= 220 / 842 + 0.01
+
+
+def test_deleted_clause_does_not_claim_earlier_page_without_later_anchor():
+    """没有第 4 页 PDF 锚点时，不能把 Word 第 4 页 deleted 误报为第 2 页。"""
+    word_pre = Clause(clause_id="w1", doc_type="word", text="第十条 其他约定。")
+    word_missing = Clause(
+        clause_id="w2",
+        doc_type="word",
+        number="10.4",
+        text="测试条款1232456767",
+        source_page_index=3,
+    )
+    pdf_pre = _pdf_clause_with_bbox("p1", "第十条 其他约定。", page=1, y1=720, y2=750)
+
+    report = build_report(
+        alignments=[
+            Alignment(word_clause_id="w1", pdf_clause_id="p1", match_type="number", similarity=1.0),
+            Alignment(word_clause_id="w2", pdf_clause_id=None, match_type="unmatched", similarity=0.0),
+        ],
+        word_by={"w1": word_pre, "w2": word_missing},
+        pdf_by={"p1": pdf_pre},
+        embed=_AlmostIdenticalEmbedding(),
+        page_metas=[_page_meta(page=index) for index in range(4)],
+        thresholds={"identical": 0.98, "modified": 0.85},
+        source="source.docx",
+        target="target.pdf",
+    )
+
+    deleted = [d for d in report.unmatched_clauses if d.status == "deleted"]
+    assert len(deleted) == 1
+    assert deleted[0].page_regions == []
+
+
+def test_deleted_clause_no_paired_neighbors_has_no_region():
+    """无任何已配对邻居时不生成占位框(deleted 仍以文本形式体现)。"""
+    missing = Clause(clause_id="w1", doc_type="word", text="第一条 验收。", number="第一条")
+
+    report = build_report(
+        alignments=[Alignment(
+            word_clause_id="w1", pdf_clause_id=None, match_type="unmatched", similarity=0.0,
+        )],
+        word_by={"w1": missing},
+        pdf_by={},
+        embed=_AlmostIdenticalEmbedding(),
+        page_metas=[_page_meta()],
+        thresholds={"identical": 0.98, "modified": 0.85},
+        source="source.docx",
+        target="target.pdf",
+    )
+
+    deleted = [d for d in report.unmatched_clauses if d.status == "deleted"]
+    assert len(deleted) == 1
+    # 无邻居 → 不生成占位 region,但 deleted 本身仍存在(文本/segment 保留)
+    assert deleted[0].page_regions == []
+    assert any(s.op == "delete" for s in deleted[0].segments)
+
+
+def test_unmatched_alignment_reason_is_preserved_in_report():
+    """对齐层给出的未对齐原因应进入 JSON/前端共用的 Diff 数据。"""
+    missing = Clause(clause_id="word-1", doc_type="word", text="合同必读")
+    reason = "最相近 PDF 条款语义相似度 0.840，低于对齐阈值 0.850"
+
+    report = build_report(
+        alignments=[Alignment(
+            word_clause_id="word-1",
+            pdf_clause_id=None,
+            match_type="unmatched",
+            similarity=0.84,
+            alignment_reason=reason,
+        )],
+        word_by={"word-1": missing},
+        pdf_by={},
+        embed=_AlmostIdenticalEmbedding(),
+        page_metas=[],
+        thresholds={"identical": 0.98, "modified": 0.85},
+        source="source.docx",
+        target="target.pdf",
+    )
+
+    assert report.unmatched_clauses[0].alignment_reason == reason
+
+
+# —— 风险判别开关(enable_risk_assessment)——
+# 默认关闭:仅列举差异(status/verdict/segments 仍由 diff 决定),
+# 不做风险分级、不抽取高风险要素、overall 从 change_status 推导。
+
+def _amount_tamper_clauses():
+    """构造一对金额被篡改的条款(高风险要素变更场景)。"""
+    word_clause = Clause(
+        clause_id="word-1",
+        doc_type="word",
+        number="1",
+        text="金额为100万元。",
+    )
+    pdf_clause = Clause(
+        clause_id="pdf-1",
+        doc_type="pdf",
+        number="1",
+        text="金额为200万元。",
+    )
+    return word_clause, pdf_clause
+
+
+def test_build_report_risk_disabled_fills_none():
+    """关闭风险判别:diff 仍报,status/verdict 保留,但 risk_level/reasons/key_elements 清空。"""
+    word_clause, pdf_clause = _amount_tamper_clauses()
+    report = build_report(
+        alignments=[Alignment(
+            word_clause_id="word-1",
+            pdf_clause_id="pdf-1",
+            match_type="number",
+            similarity=0.8,
+        )],
+        word_by={"word-1": word_clause},
+        pdf_by={"pdf-1": pdf_clause},
+        embed=_AlmostIdenticalEmbedding(),
+        page_metas=[],
+        thresholds={"identical": 0.98, "modified": 0.85},
+        source="source.docx",
+        target="target.pdf",
+        enable_risk_assessment=False,
+    )
+
+    assert len(report.diffs) == 1
+    d = report.diffs[0]
+    # 变化本身仍被识别
+    assert d.status == "modified"
+    assert d.verdict == "changed"
+    # 风险字段被短路
+    assert d.risk_level == "none"
+    assert d.risk_reasons == []
+    # 高风险要素未抽取
+    assert report.key_elements == []
+    assert report.summary["key_element_changes"] == 0
+
+
+def test_build_report_risk_enabled_keeps_legacy_behavior():
+    """开启风险判别:同一输入应恢复完整风险分级(金额变更 → high + key_elements)。"""
+    word_clause, pdf_clause = _amount_tamper_clauses()
+    report = build_report(
+        alignments=[Alignment(
+            word_clause_id="word-1",
+            pdf_clause_id="pdf-1",
+            match_type="number",
+            similarity=0.8,
+        )],
+        word_by={"word-1": word_clause},
+        pdf_by={"pdf-1": pdf_clause},
+        embed=_AlmostIdenticalEmbedding(),
+        page_metas=[],
+        thresholds={"identical": 0.98, "modified": 0.85},
+        source="source.docx",
+        target="target.pdf",
+        enable_risk_assessment=True,
+    )
+
+    assert len(report.diffs) == 1
+    d = report.diffs[0]
+    assert d.status == "modified"
+    assert d.risk_level == "high"
+    assert d.risk_reasons  # 非空
+    assert any(e.kind == "amount" and e.changed for e in report.key_elements)
+    assert report.overall_risk == "high"
+
+
+def test_build_report_risk_disabled_overall_uses_change_status():
+    """关闭风险 + 有差异 → overall_risk 镜像 change_status,不再表达高/中/低。
+
+    changed → changed(不再出现 low),clean → clean。
+    """
+    word_clause, pdf_clause = _amount_tamper_clauses()
+    # 有差异
+    report_changed = build_report(
+        alignments=[Alignment(
+            word_clause_id="word-1",
+            pdf_clause_id="pdf-1",
+            match_type="number",
+            similarity=0.8,
+        )],
+        word_by={"word-1": word_clause},
+        pdf_by={"pdf-1": pdf_clause},
+        embed=_AlmostIdenticalEmbedding(),
+        page_metas=[],
+        thresholds={"identical": 0.98, "modified": 0.85},
+        source="source.docx",
+        target="target.pdf",
+        enable_risk_assessment=False,
+    )
+    assert report_changed.change_status == "changed"
+    assert report_changed.overall_risk == "changed"  # 镜像 change_status
+
+    # 无差异(两侧文本完全一致)
+    same_word = Clause(clause_id="word-2", doc_type="word", number="2", text="甲方提供设备。")
+    same_pdf = Clause(clause_id="pdf-2", doc_type="pdf", number="2", text="甲方提供设备。")
+    report_clean = build_report(
+        alignments=[Alignment(
+            word_clause_id="word-2",
+            pdf_clause_id="pdf-2",
+            match_type="number",
+            similarity=1.0,
+        )],
+        word_by={"word-2": same_word},
+        pdf_by={"pdf-2": same_pdf},
+        embed=_AlmostIdenticalEmbedding(),
+        page_metas=[],
+        thresholds={"identical": 0.98, "modified": 0.85},
+        source="source.docx",
+        target="target.pdf",
+        enable_risk_assessment=False,
+    )
+    assert report_clean.change_status == "clean"
+    assert report_clean.overall_risk == "clean"
+    assert report_clean.diffs == []
+
+
+def test_apply_recognition_gate_risk_off_returns_changed():
+    """apply_recognition_gate 在 risk-off 模式下:confirmed → overall_risk='changed'(不再 'low')。
+
+    回归保护:gate 会在 build_report 之后无条件运行并覆盖 overall_risk,
+    若不区分 flag,confirmed 分支会硬编码 'low'。本测试验证 risk-off 时镜像 change_status。
+
+    关键:必须存在 unreliable 页面才能让 gate 进入 confirmed/review 分支(全可靠时 gate 提前 return)。
+    diff 落在可靠页(page 0),unrelated 的不可靠页(page 1)用来触发 gate 主体逻辑但不影响该 diff。
+    """
+    from document_comparison.models import Diff, PageRegion, PageRecognitionDiagnostic
+    from document_comparison.ocr.quality import apply_recognition_gate
+
+    def _make_report(*, risk_level: str, initial_overall: str) -> TamperReport:
+        return TamperReport(
+            source="s.docx",
+            target="t.pdf",
+            overall_risk=initial_overall,
+            change_status="changed",
+            diffs=[
+                Diff(
+                    alignment_id="al1",
+                    status="modified",
+                    risk_level=risk_level,
+                    page_regions=[PageRegion(page_index=0, bbox=[0, 0, 1, 1])],
+                ),
+            ],
+        )
+
+    # page 0 可靠(diff 所在页)、page 1 不可靠(无关页,只为触发 gate 主体)
+    diagnostics = [
+        PageRecognitionDiagnostic(page_index=0, source="native", reliable=True, char_count=100),
+        PageRecognitionDiagnostic(page_index=1, source="fallback", reliable=False, char_count=50),
+    ]
+
+    # risk-off(默认):confirmed → 'changed',绝不出现 'low'
+    report = _make_report(risk_level="high", initial_overall="high")
+    apply_recognition_gate(report, diagnostics, enable_risk_assessment=False)
+    assert report.change_status == "changed"
+    assert report.overall_risk == "changed"
+
+    # risk-on:仍按 levels 取最高(这里 high)
+    report2 = _make_report(risk_level="high", initial_overall="clean")
+    apply_recognition_gate(report2, diagnostics, enable_risk_assessment=True)
+    assert report2.overall_risk == "high"
+
+
+def test_apply_recognition_gate_risk_off_empty_levels_returns_changed():
+    """risk-off + confirmed + 所有 diff.risk_level='none' → 'changed'(不再 'low')。
+
+    这正是默认比对的真实场景:diff.risk_level 恒为 none,gate 旧逻辑会返回 'low'。
+    同样需要 unrelated 不可靠页来触发 gate 主体。
+    """
+    from document_comparison.models import Diff, PageRegion, PageRecognitionDiagnostic
+    from document_comparison.ocr.quality import apply_recognition_gate
+
+    report = TamperReport(
+        source="s.docx",
+        target="t.pdf",
+        overall_risk="clean",
+        change_status="changed",
+        diffs=[
+            Diff(
+                alignment_id="al1",
+                status="modified",
+                risk_level="none",
+                page_regions=[PageRegion(page_index=0, bbox=[0, 0, 1, 1])],
+            ),
+        ],
+    )
+    diagnostics = [
+        PageRecognitionDiagnostic(page_index=0, source="native", reliable=True, char_count=100),
+        PageRecognitionDiagnostic(page_index=1, source="fallback", reliable=False, char_count=50),
+    ]
+    apply_recognition_gate(report, diagnostics)  # 默认 enable_risk_assessment=False
+    assert report.overall_risk == "changed"
+
+
+def test_location_gap_is_reported_without_changing_contract_verdict():
+    from document_comparison.models import PageRecognitionDiagnostic
+    from document_comparison.ocr.quality import apply_recognition_gate
+
+    report = TamperReport(
+        source="s.docx",
+        target="t.pdf",
+        overall_risk="clean",
+        change_status="clean",
+    )
+    diagnostics = [
+        PageRecognitionDiagnostic(
+            page_index=0,
+            source="fallback",
+            reliable=True,
+            location_status="partial",
+            bbox_coverage=0.72,
+            char_count=100,
+        )
+    ]
+
+    apply_recognition_gate(report, diagnostics)
+
+    assert report.change_status == "clean"
+    assert report.recognition_status == "reliable"
+    assert report.location_status == "partial"
+    assert report.summary["location_quality"] == "partial"
+    assert report.summary["unlocated_pages"] == [1]

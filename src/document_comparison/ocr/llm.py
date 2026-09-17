@@ -6,8 +6,9 @@
 - 每页 PDF 渲染为 PNG,以 image_url 发多模态请求,要求 LLM 返回 JSON 版面块。
 - 输出统一为 Block(bbox 为 PDF 点坐标),与 mock 引擎一致。
 
-配置(统一持久化于 .dc_data/llm_config.json,在 UI 设置页维护):
-- llm_api_base           API 根地址(兼容 OpenAI 协议)
+配置(统一持久化于 Postgres llm_config 表,在 UI 设置页维护):
+- llm_api_protocol       接口协议(openai | openai_responses | anthropic,默认 openai)
+- llm_api_base           API 根地址(按所选协议拼 /chat/completions、/responses 或 /messages)
 - llm_api_key            API Key
 - llm_model              多模态模型名
 - llm_timeout            单次请求读取超时秒(默认 120;连接超时固定 10s)
@@ -23,6 +24,7 @@ import random
 import re
 from collections import deque
 from pathlib import Path
+import contextvars
 import threading
 import time
 from typing import Any
@@ -31,11 +33,23 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+from .._llm_json import extract_llm_json
 from ..config import settings
+from ..llm_protocol import build_chat_request, parse_chat_content
 from ..models import Block, PageMeta, TableStructure
-from ..observability import log_model_request, log_model_response
-from ..parsing.pdf import render_pages
+from ..observability import (
+    log_model_failure,
+    log_model_request,
+    log_model_response,
+)
+from ..parsing.pdf import render_page, render_pages
 from .base import ProgressCb
+from .seal import (
+    PreparedSealVariant,
+    SealRecoveryDiagnostic,
+    merge_seal_ocr_blocks,
+    prepare_seal_variant,
+)
 
 # 要求 LLM 返回的 JSON 结构:
 # {"blocks": [{"label": ..., "content": ..., "bbox": [x1,y1,x2,y2], "table": {"headers":[...], "rows":[...]}}]}
@@ -66,6 +80,29 @@ _SYSTEM_PROMPT = (
     '字段名带冒号,如 content="甲方(甲方主体):XX公司"、content="联系电话:138..."。'
 )
 
+# 整图(长图)整体 OCR 用的提示词:只要纯文本,不要求版面块 JSON。
+# 用于无标注版管线的扫描件兜底——所有页拼成一张长图,单次调用取全文。
+_WHOLE_DOC_OCR_PROMPT = (
+    "你是一个文档文字识别助手。给定一张可能包含多页的完整文档图片,"
+    "请按人类阅读顺序(从上到下、从左到右)识别其中全部文字内容,直接输出纯文本。"
+    "不要输出 JSON,不要解释,不要加页码或分隔标记。"
+    "要求:\n"
+    "- 保留原文的段落与换行结构,段落之间空一行。\n"
+    "- 表格内容每行用「 | 」(竖线两侧各一个空格)分隔单元格,首行是表头,"
+    "不要输出 Markdown 表格语法,不要分隔行(如 |---|---|)。\n"
+    "- 只输出识别到的文字,不要添加标题、说明或格式包裹。"
+)
+
+_DRAWING_CLASSIFICATION_PROMPT = (
+    "你是合同附件页面分类器。判断给定页面属于合同正文、工程图纸或无法确定。"
+    "工程图纸包括CAD图、结构图、装配图、产品图，通常包含图号、比例、制图/审核标题栏、"
+    "尺寸标注和大量线框。合同正文包括条款、表格、签字盖章页；即使文字很少也不能误判为图纸。"
+    "严格只输出JSON对象，不要解释或输出markdown。结构为:"
+    '{"page_type":"contract_body|engineering_drawing|unknown",'
+    '"confidence":0到1之间的数字,"signals":["简短证据"]}。'
+    "证据不足时必须返回unknown；不得仅凭横向页面或文字较少判为工程图纸。"
+)
+
 
 class LLMOCREngine:
     """通过多模态 LLM API 识别 PDF 版面。
@@ -82,6 +119,7 @@ class LLMOCREngine:
         timeout: float | None = None,
         max_concurrency: int | None = None,
         max_retries: int | None = None,
+        api_protocol: str | None = None,
     ) -> None:
         self.api_base = api_base if api_base is not None else settings.llm_api_base
         self.api_key = api_key if api_key is not None else settings.llm_api_key
@@ -93,7 +131,11 @@ class LLMOCREngine:
         self.max_retries = (
             max_retries if max_retries is not None else settings.llm_max_retries
         )
+        self.api_protocol = (
+            api_protocol if api_protocol is not None else settings.llm_api_protocol
+        )
         self._dpi = settings.pdf_render_dpi
+        self.last_seal_diagnostics: dict[int, SealRecoveryDiagnostic] = {}
 
     # —— 公共接口 ——
     def recognize(
@@ -104,6 +146,7 @@ class LLMOCREngine:
         on_progress: ProgressCb | None = None,
     ) -> list[list[Block]]:
         self._validate_config()
+        self.last_seal_diagnostics = {}
         images = render_pages(pdf_path, dpi=self._dpi)
         if not images:
             logger.info("ocr recognize pages=0 (empty pdf)")
@@ -112,6 +155,33 @@ class LLMOCREngine:
             "ocr recognize pages=%s dpi=%s concurrency=%s model=%s",
             len(images), self._dpi, self.max_concurrency, self.model,
         )
+
+        seal_inputs: list[tuple[PreparedSealVariant, PageMeta] | None] = [
+            None
+        ] * len(images)
+        if getattr(settings, "seal_recovery_enabled", False):
+            recovery_dpi = max(
+                self._dpi, int(getattr(settings, "seal_recovery_dpi", 300))
+            )
+            for page_index, image in enumerate(images):
+                prepared = prepare_seal_variant(image)
+                if prepared is None:
+                    continue
+                if recovery_dpi != self._dpi:
+                    high_res = render_page(
+                        pdf_path, page_index, dpi=recovery_dpi
+                    )
+                    prepared = prepare_seal_variant(high_res) or prepared
+                seal_inputs[page_index] = (
+                    prepared,
+                    PageMeta(
+                        page_index=page_index,
+                        width_px=prepared.width_px,
+                        height_px=prepared.height_px,
+                        pdf_width_pt=page_metas[page_index].pdf_width_pt,
+                        pdf_height_pt=page_metas[page_index].pdf_height_pt,
+                    ),
+                )
 
         # Pre-warm certifi CA bundle before spawning threads — certifi.where()
         # uses an unlocked global guard that races under concurrent access.
@@ -133,10 +203,13 @@ class LLMOCREngine:
         with httpx.Client(timeout=timeout, limits=limits) as client:
             with _BoundedConcurrency(self.max_concurrency) as pool:
                 for i, img in enumerate(images):
+                    seal_input = seal_inputs[i]
                     pool.submit(
                         self._recognize_page,
                         i, img, page_metas[i], results,
                         on_progress, total, done_count, client,
+                        seal_input[0] if seal_input else None,
+                        seal_input[1] if seal_input else None,
                     )
 
         return results
@@ -152,10 +225,43 @@ class LLMOCREngine:
         total_pages: int = 1,
         done_count: list[int] | None = None,
         client: httpx.Client | None = None,
+        prepared_seal: PreparedSealVariant | None = None,
+        recovery_meta: PageMeta | None = None,
     ) -> None:
         data_url = _to_data_url(png_bytes)
         content = self._chat(data_url, client=client)
         blocks = _parse_blocks(content, page_index, meta)
+        if getattr(settings, "seal_recovery_enabled", False):
+            prepared = prepared_seal or prepare_seal_variant(png_bytes)
+            if prepared is not None:
+                variant_meta = recovery_meta or meta
+                try:
+                    recovered_content = self._chat(
+                        _to_data_url(prepared.png_bytes), client=client
+                    )
+                    recovered_blocks = _parse_blocks(
+                        recovered_content, page_index, variant_meta
+                    )
+                except Exception as exc:  # noqa: BLE001 -- 原图 OCR 已成功
+                    logger.warning(
+                        "seal recovery ocr failed page=%s error_type=%s",
+                        page_index,
+                        type(exc).__name__,
+                    )
+                    blocks = [b for b in blocks if b.label != "seal"]
+                    self.last_seal_diagnostics[page_index] = (
+                        SealRecoveryDiagnostic(
+                            reliable=False,
+                            reasons=("检测到印章，但二次 OCR 失败",),
+                            region_count=len(prepared.regions_px),
+                        )
+                    )
+                else:
+                    merged = merge_seal_ocr_blocks(
+                        blocks, recovered_blocks, prepared, variant_meta
+                    )
+                    blocks = list(merged.blocks)
+                    self.last_seal_diagnostics[page_index] = merged.diagnostic
         out[page_index] = blocks
         if on_progress:
             done_count[0] += 1
@@ -174,7 +280,6 @@ class LLMOCREngine:
             raise ValueError("llm_max_retries 不能小于 0")
 
     def _chat(self, data_url: str, *, client: httpx.Client | None = None) -> str:
-        url = self.api_base.rstrip("/") + "/chat/completions"
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [
@@ -196,27 +301,158 @@ class LLMOCREngine:
             # 结构化输出:降低温度,要求 JSON
             "temperature": 0,
             "response_format": {"type": "json_object"},
+            # chat_template_kwargs.enable_thinking=False:关闭 Qwen3 系列默认输出的
+            # <think> 思考链 token(OCR 识别是确定性任务,这些 token 不进结果但严重拖慢
+            # 生成)。必须嵌进 chat_template_kwargs 才会被 vLLM 应用到 chat template;
+            # 顶层 enable_thinking 字段在多数 vLLM 版本被忽略(见 vllm#35574)。
+            # 非 Qwen3 模型按 OpenAI 兼容约定忽略未知参数,不报错。
+            "chat_template_kwargs": {"enable_thinking": False},
         }
-        # 本地 OpenAI 兼容服务可能无需 key；空 key 时不要构造非法 Bearer 头。
-        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
-        # 多模态 OCR 单页推理可能很慢:连接快速失败,读取给予充分时间。
-        # 可重试的瞬态故障:超时 / 网络传输错误 / 429 / 5xx。
-        # (httpx.TransportError 覆盖 ConnectError / ReadTimeout / NetworkError 等)
-        # 4xx(鉴权、参数错误等)不可重试,立即抛出。
+        return self._post_chat(payload, kind="ocr", client=client)
+
+    def recognize_text(
+        self, image_bytes: bytes, *, client: httpx.Client | None = None
+    ) -> str:
+        """单次 OCR 取纯文本(无标注版扫描件识别用)。
+
+        与逐页结构化 `recognize` 的区别:不要求 JSON 版面块,直接让模型按阅读顺序
+        输出该图片的纯文本,表格用「cell | cell」格式。既可处理整张长图,也可处理
+        单页图片;无标注版扫描件采用逐页并发调用本方法、最后按序拼接成整篇纯文本。
+
+        `client` 可传入共享的 httpx.Client 以复用 TCP/TLS 连接池(并发场景)。
+        """
+        self._validate_config()
+        data_url = _to_data_url(image_bytes)
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": _WHOLE_DOC_OCR_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "请识别这张文档图片的全部文字,按阅读顺序输出。"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": data_url, "detail": "high"},
+                        },
+                    ],
+                },
+            ],
+            "temperature": 0,
+            # chat_template_kwargs.enable_thinking=False:关闭 Qwen3 系列默认输出的
+            # <think> 思考链 token(整篇纯文本 OCR 是确定性任务,这些 token 不进结果但
+            # 严重拖慢生成)。必须嵌进 chat_template_kwargs 才会被 vLLM 应用到 chat
+            # template;顶层 enable_thinking 字段在多数 vLLM 版本被忽略(见 vllm#35574)。
+            # 非 Qwen3 模型按 OpenAI 兼容约定忽略未知参数,不报错。
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        return self._post_chat(payload, kind="ocr-whole", client=client)
+
+    def classify_drawing_page(
+        self,
+        image_bytes: bytes,
+        *,
+        page_number: int,
+        extracted_text: str = "",
+        client: httpx.Client | None = None,
+    ) -> dict[str, Any]:
+        """用通用 VL 模型对规则无法判断的单页做安全三分类。"""
+        self._validate_config()
+        text_hint = (extracted_text or "").strip()
+        if len(text_hint) > 2000:
+            text_hint = text_hint[:2000]
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": _DRAWING_CLASSIFICATION_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                f"这是供应商PDF第{page_number}页。"
+                                f"已提取文字如下:\n{text_hint or '（无可靠文本层）'}"
+                                "\n请按约定JSON判断页面类型。"
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": _to_data_url(image_bytes),
+                                "detail": "high",
+                            },
+                        },
+                    ],
+                },
+            ],
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        content = self._post_chat(payload, kind="ocr", client=client)
+        parsed = extract_llm_json(content, expect=dict)
+        if not isinstance(parsed, dict):
+            raise ValueError("图纸页面分类未返回JSON对象")
+        page_type = str(parsed.get("page_type") or "")
+        if page_type not in {"contract_body", "engineering_drawing", "unknown"}:
+            raise ValueError("图纸页面分类返回了未知 page_type")
+        try:
+            confidence = float(parsed.get("confidence"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("图纸页面分类 confidence 无效") from exc
+        if not 0.0 <= confidence <= 1.0:
+            raise ValueError("图纸页面分类 confidence 必须在 0 到 1 之间")
+        raw_signals = parsed.get("signals")
+        signals = (
+            [str(item)[:200] for item in raw_signals if str(item).strip()]
+            if isinstance(raw_signals, list)
+            else []
+        )
+        return {
+            "page_type": page_type,
+            "confidence": confidence,
+            "signals": signals,
+        }
+
+    def _post_chat(
+        self,
+        payload: dict[str, Any],
+        *,
+        kind: str,
+        client: httpx.Client | None = None,
+    ) -> str:
+        """统一的对话 LLM POST + 重试骨架,返回 assistant 文本。
+
+        payload 按 OpenAI Chat Completions 规范形态构造,发送前经
+        llm_protocol.build_chat_request 按所选协议(api_protocol)转换为
+        /chat/completions、/responses 或 /messages 的请求体。
+
+        可重试瞬态故障:超时 / 网络传输错误 / 429 / 5xx。
+        (httpx.TransportError 覆盖 ConnectError / ReadTimeout / NetworkError 等)
+        4xx(鉴权、参数错误等)不可重试,立即抛出。
+        """
+        url, headers, payload = build_chat_request(
+            api_base=self.api_base,
+            api_key=self.api_key,
+            payload=payload,
+            protocol=self.api_protocol,
+        )
         last_exc: Exception | None = None
         owns_client = client is None
         if client is None:
             client = httpx.Client(timeout=httpx.Timeout(self.timeout, connect=10.0))
         try:
             for attempt in range(self.max_retries + 1):
-                request_started = log_model_request(logger, "ocr", url, payload, attempt + 1)
+                request_started = log_model_request(logger, kind, url, payload, attempt + 1)
                 try:
                     resp = client.post(url, json=payload, headers=headers)
                 except httpx.TransportError as exc:
                     last_exc = exc
+                    log_model_failure(logger, kind, request_started, str(exc))
                     logger.warning(
-                        "ocr transport error attempt=%s/%s reason=%s",
-                        attempt + 1, self.max_retries + 1, exc,
+                        "%s transport error attempt=%s/%s reason=%s",
+                        kind, attempt + 1, self.max_retries + 1, exc,
                     )
                 else:
                     if resp.status_code == 429 or resp.status_code >= 500:
@@ -225,21 +461,35 @@ class LLMOCREngine:
                             request=resp.request,
                             response=resp,
                         )
+                        log_model_failure(
+                            logger, kind, request_started,
+                            f"transient HTTP {resp.status_code}",
+                            status_code=resp.status_code,
+                            response=resp.text,
+                        )
                         logger.warning(
-                            "ocr transient http status=%s attempt=%s/%s",
-                            resp.status_code, attempt + 1, self.max_retries + 1,
+                            "%s transient http status=%s attempt=%s/%s",
+                            kind, resp.status_code, attempt + 1, self.max_retries + 1,
                         )
                     else:
-                        resp.raise_for_status()  # 4xx:不可重试,直接抛
+                        try:
+                            resp.raise_for_status()  # 4xx:不可重试,直接抛
+                        except httpx.HTTPStatusError as exc:
+                            log_model_failure(
+                                logger, kind, request_started, str(exc),
+                                status_code=resp.status_code,
+                                response=resp.text,
+                            )
+                            raise
                         data = resp.json()
-                        log_model_response(logger, "ocr", resp.status_code, data, request_started)
-                        return data["choices"][0]["message"]["content"]
+                        log_model_response(logger, kind, resp.status_code, data, request_started)
+                        return parse_chat_content(data, protocol=self.api_protocol)
                 if attempt < self.max_retries:
                     backoff = min(2 ** attempt, 8) + random.random()
-                    logger.info("ocr retry after %.1fs", backoff)
+                    logger.info("%s retry after %.1fs", kind, backoff)
                     time.sleep(backoff)
             assert last_exc is not None
-            logger.error("ocr give up after %s attempts: %s", self.max_retries + 1, last_exc)
+            logger.error("%s give up after %s attempts: %s", kind, self.max_retries + 1, last_exc)
             raise last_exc
         finally:
             if owns_client:
@@ -359,26 +609,12 @@ def _to_pt_bbox(
 
 
 def _extract_json(text: str) -> Any:
-    """从可能混杂文本/代码块的回复中提取首个 JSON 对象或数组。"""
-    text = text.strip()
-    # 去 markdown 代码围栏
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    # 兜底:取首个 {...} 或 [...]
-    for pat in (r"\{[\s\S]*\}", r"\[[\s\S]*\]"):
-        m = re.search(pat, text)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except json.JSONDecodeError:
-                continue
-    logger.warning("ocr json parse failed, treating as empty; raw=%s", text[:200])
-    return {}
+    """从可能混杂文本/代码块的回复中提取首个 JSON 对象或数组。
+
+    委托给共享 helper ``_llm_json.extract_llm_json``,保留薄封装以维持本模块内的
+    既有调用点签名(允许返回 dict 或 list,供 ``_parse_blocks`` 分支处理)。
+    """
+    return extract_llm_json(text, expect=(dict, list))
 
 
 class _BoundedConcurrency:
@@ -396,13 +632,16 @@ class _BoundedConcurrency:
 
     def submit(self, fn, *args) -> None:
         self._sem.acquire()
-        t = threading.Thread(target=self._run, args=(fn, args), daemon=True)
+        # 捕获当前 context(含 observability.current_llm_collector),让子线程能
+        # 继续把 LLM 调用记录 append 到任务收集器。threading.Thread 不会自动继承。
+        ctx = contextvars.copy_context()
+        t = threading.Thread(target=self._run, args=(ctx, fn, args), daemon=True)
         t.start()
         self._threads.append(t)
 
-    def _run(self, fn, args) -> None:
+    def _run(self, ctx, fn, args) -> None:
         try:
-            fn(*args)
+            ctx.run(fn, *args)
         except BaseException as exc:  # noqa: BLE001 — 收集后统一重抛
             self._exc.append(exc)
         finally:

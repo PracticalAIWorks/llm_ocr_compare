@@ -25,6 +25,7 @@ export const useRawTaskStore = defineStore('rawTask', () => {
   const status = ref<TaskStatus>('pending')
   const stage = ref('')
   const progress = ref(0)
+  const stageTimings = ref<Record<string, number>>({})
   const error = ref<string | null>(null)
   const report = ref<TextDiffReport | null>(null)
   const elapsed = ref<number | null>(null)
@@ -41,6 +42,7 @@ export const useRawTaskStore = defineStore('rawTask', () => {
     status.value = 'pending'
     stage.value = ''
     progress.value = 0
+    stageTimings.value = {}
     error.value = null
     report.value = null
     elapsed.value = null
@@ -52,6 +54,7 @@ export const useRawTaskStore = defineStore('rawTask', () => {
     status.value = info.status
     stage.value = info.stage || stage.value
     progress.value = info.progress ?? progress.value
+    stageTimings.value = info.stage_timings ?? stageTimings.value
     error.value = info.error
     elapsed.value = info.elapsed
     if (info.raw_report) report.value = info.raw_report
@@ -80,6 +83,7 @@ export const useRawTaskStore = defineStore('rawTask', () => {
       onEvent: (ev) => {
         if (ev.stage) stage.value = ev.stage
         if (typeof ev.progress === 'number') progress.value = ev.progress
+        if (ev.stage_timings) stageTimings.value = ev.stage_timings
         if (ev.status) status.value = ev.status
         if (ev.error) error.value = ev.error
       },
@@ -136,6 +140,7 @@ export const useRawTaskStore = defineStore('rawTask', () => {
     status,
     stage,
     progress,
+    stageTimings,
     error,
     report,
     elapsed,

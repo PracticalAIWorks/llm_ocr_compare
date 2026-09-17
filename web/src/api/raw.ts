@@ -5,18 +5,16 @@ import type {
   RawCompareOptions,
   RawTaskInfo,
   TaskStatus,
-  TextDiffReport,
 } from './types'
 import { ApiError, openEventStream, request } from './client'
 
 export { ApiError }
 
 export interface RawSubmitArgs {
-  source: File // .docx
+  source: File // .docx 或 .pdf
   target: File // .pdf
   options?: RawCompareOptions
   callbackUrl?: string
-  callbackSecret?: string
 }
 
 export function submitRawCompare(args: RawSubmitArgs): Promise<{ task_id: string; status: TaskStatus }> {
@@ -25,7 +23,6 @@ export function submitRawCompare(args: RawSubmitArgs): Promise<{ task_id: string
   form.append('target', args.target)
   if (args.options) form.append('options', JSON.stringify(args.options))
   if (args.callbackUrl) form.append('callback_url', args.callbackUrl)
-  if (args.callbackSecret) form.append('callback_secret', args.callbackSecret)
   return request('/api/v1/raw-compare', { method: 'POST', body: form })
 }
 
@@ -33,9 +30,6 @@ export function getRawTask(taskId: string): Promise<RawTaskInfo> {
   return request(`/api/v1/raw-compare/${encodeURIComponent(taskId)}`)
 }
 
-export function getRawReport(taskId: string): Promise<TextDiffReport> {
-  return request(`/api/v1/raw-compare/${encodeURIComponent(taskId)}/report`)
-}
 
 export interface RawProgressHandlers {
   onEvent: (ev: ProgressEvent) => void

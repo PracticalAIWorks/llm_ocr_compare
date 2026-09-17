@@ -5,20 +5,14 @@ import type {
   SubmitResponse,
   TaskInfo,
   TaskStatus,
-  TamperReport,
 } from './types'
 import { ApiError, apiUrl, openEventStream, request } from './client'
 
-export function health(): Promise<{ status: string }> {
-  return request('/health')
-}
-
 export interface SubmitArgs {
-  source: File // .docx
+  source: File // .docx 或 .pdf
   target: File // .pdf
   options?: CompareOptions
   callbackUrl?: string
-  callbackSecret?: string
 }
 
 export function submitCompare(args: SubmitArgs): Promise<SubmitResponse> {
@@ -27,18 +21,41 @@ export function submitCompare(args: SubmitArgs): Promise<SubmitResponse> {
   form.append('target', args.target)
   if (args.options) form.append('options', JSON.stringify(args.options))
   if (args.callbackUrl) form.append('callback_url', args.callbackUrl)
-  if (args.callbackSecret) form.append('callback_secret', args.callbackSecret)
   return request('/api/v1/compare', { method: 'POST', body: form })
+}
+
+export interface CompareApiTestInfo {
+  task_id: string
+  document_no: string
+  status: 'pending' | 'running' | 'done' | 'failed'
+  stage?: string
+  progress?: number
+  error?: string | null
+  change_status?: 'clean' | 'changed' | 'needs_review'
+  result_text?: string
+  highlight_images?: string[]
+}
+
+/** 使用合同比对页已选文件验证外部 API 的完整产物管线，不发送回调。 */
+export function submitCompareApiTest(source: File, target: File): Promise<CompareApiTestInfo> {
+  const form = new FormData()
+  form.append('source', source)
+  form.append('target', target)
+  return request('/api/v1/compare/api-test', { method: 'POST', body: form })
+}
+
+export function getCompareApiTest(taskId: string): Promise<CompareApiTestInfo> {
+  return request(`/api/v1/compare/api-test/${encodeURIComponent(taskId)}`)
+}
+
+export function getCompareApiTestImageUrl(taskId: string, pageNumber: number): string {
+  return apiUrl(
+    `/api/v1/compare/api-test/${encodeURIComponent(taskId)}/images/${pageNumber}`,
+  )
 }
 
 export function getTask(taskId: string): Promise<TaskInfo> {
   return request(`/api/v1/compare/${encodeURIComponent(taskId)}`)
-}
-
-export function getReport(taskId: string, format: 'json' = 'json'): Promise<TamperReport> {
-  return request(
-    `/api/v1/compare/${encodeURIComponent(taskId)}/report?format=${format}`,
-  )
 }
 
 /** 返回 PDF 源文件的可访问 URL，供 <iframe> 或 pdf.js 加载。 */
@@ -46,35 +63,29 @@ export function getSourcePdfUrl(taskId: string): string {
   return apiUrl(`/api/v1/compare/${encodeURIComponent(taskId)}/source`)
 }
 
-/** 返回带差异高亮的 Word 报告下载 URL（整段黄底标注被篡改条款）。 */
-export function getAnnotatedDocxUrl(taskId: string): string {
-  return apiUrl(
-    `/api/v1/compare/${encodeURIComponent(taskId)}/report?format=docx`,
-  )
+/** 返回原件 PDF 的可访问 URL；DOCX 原件由服务端明确返回 409。 */
+export function getOriginalPdfUrl(taskId: string): string {
+  return apiUrl(`/api/v1/compare/${encodeURIComponent(taskId)}/original-pdf`)
 }
 
-/** 返回带差异高亮框的 PDF 报告下载 URL（原生 PDF 有效，扫描件无坐标）。 */
-export function getAnnotatedPdfUrl(taskId: string): string {
-  return apiUrl(
-    `/api/v1/compare/${encodeURIComponent(taskId)}/report?format=pdf`,
-  )
+/** 下载采购部合同的原始上传文件；DOCX 保持 DOCX，不会替换为预览用 PDF。 */
+export function getSourceFileDownloadUrl(taskId: string): string {
+  return apiUrl(`/api/v1/tasks/${encodeURIComponent(taskId)}/source/download`)
 }
 
-/** docx 高亮预览段落（后端 /docx-preview 接口返回）。 */
-export interface PreviewParagraph {
-  text: string
-  highlight: '' | 'modified' | 'deleted'
-  status: string
-  risk_level: string
-  number: string
+/** 下载供应商合同的原始上传 PDF，不会替换为页数截断后的比对文件。 */
+export function getTargetFileDownloadUrl(taskId: string): string {
+  return apiUrl(`/api/v1/tasks/${encodeURIComponent(taskId)}/target/download`)
 }
 
-/** 拉取源 docx 的全段落 + 差异标记，供 HTML 渲染在线高亮预览。 */
-export async function getDocxPreview(taskId: string): Promise<PreviewParagraph[]> {
-  const data = await request<{ paragraphs: PreviewParagraph[] }>(
-    `/api/v1/compare/${encodeURIComponent(taskId)}/docx-preview`,
-  )
-  return data.paragraphs
+/** 下载自包含 HTML 报告；包含差异表和可联动跳转的高亮页面。 */
+export function getHtmlReportUrl(taskId: string): string {
+  return apiUrl(`/api/v1/compare/${encodeURIComponent(taskId)}/report?format=html`)
+}
+
+/** 下载自包含 PDF 比对报告（概要+差异明细+逐页高亮图）；缺失时服务端按需生成。 */
+export function getPdfReportUrl(taskId: string): string {
+  return apiUrl(`/api/v1/compare/${encodeURIComponent(taskId)}/report.pdf`)
 }
 
 export interface ProgressHandlers {
