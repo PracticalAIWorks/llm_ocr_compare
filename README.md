@@ -355,6 +355,7 @@ OCR 解析结果，包括页码、块类型、坐标、字符数、内容 SHA-25
 | `GET` | `/api/v1/statement/{task_id}` | 查询统计任务状态和结果 |
 | `GET` | `/api/v1/statement/{task_id}/events` | 订阅 SSE 进度 |
 | `GET` | `/api/v1/statement/{task_id}/report` | 获取统计报告(含总合计、按列汇总、逐行明细) |
+| `GET` | `/api/v1/statement/{task_id}/files/{file_index}/download` | 下载原始 PDF 附件，`file_index` 为报告中的零基文件序号；需控制台会话鉴权（启用口令时） |
 | `POST` | `/api/v1/external/amountStat` | 外部系统提交金额统计(`X-API-Key`,多 PDF,支持 `target`/`target_urls` 混合);默认异步,`sync=true` 同步返回结果。详见 [金额统计对外 API 文档](docs/external-amount-api.md) |
 | `GET` | `/api/v1/external/amountStat/{task_id}` | 外部系统查询金额统计结果(扁平汇总字段与每文件合计，不含完整 `report`) |
 | `GET` | `/api/v1/config/llm` | 获取当前模型配置（Key 脱敏） |
@@ -369,6 +370,8 @@ OCR 解析结果，包括页码、块类型、坐标、字符数、内容 SHA-25
 | `GET` | `/api/v1/tasks/{task_id}/external-calls` | 查询单任务的外部接口入站调用审计记录 |
 | `GET` | `/api/v1/external-calls?endpoint=&status_code=&document_no=&q=&limit=&offset=` | 全局外部接口调用审计列表(含 401/422 等无 task_id 的失败调用) |
 | `GET` | `/api/v1/stats/daily?days=14` / `?start=&end=` | 每日调用统计(看板):按天(北京时间)聚合任务数、模型调用数、外部接口调用数,含成功/失败与类型细分,缺失日期补零;`start`/`end`(YYYY-MM-DD)任一提供即自由选区间(缺省侧由今天/`days` 补齐,跨度上限 366 天) |
+
+金额统计报告页的每个文件卡片提供“下载原始附件”，按文件序号下载对应的原始 PDF 并保留原文件名（同名附件分别下载）。历史任务同样支持；附件已过期或被清理时，下载接口返回 404。
 
 ### 外部合同比对调用示例
 
@@ -524,6 +527,8 @@ curl -H 'X-API-Key: <YOUR_API_KEY>' \
 - `error`（按状态码映射固定摘要，如 `invalid external API key`）、`request_id`、`content_length`、`created_at`
 
 审计通过 HTTP 中间件统一写入，**异步落库、绝不阻塞响应**；写库失败只记日志。
+
+`target_urls` 的 JSON 数组或同名重复字段会统一按 URL 列表保存，512 字符截断限制作用于每条 URL，不再截断整个数组。对比记录的“外部调用”参数按多行展示，长 URL 自动换行。401/422 预读仍受单字段 64KB 上限约束；历史记录中已截断的内容无法自动恢复。
 每个响应都会带 `X-Request-Id` 响应头（与响应体 `request_id` 一致），便于调用方与服务端联查。
 查询入口：按任务 `GET /api/v1/tasks/{task_id}/external-calls`（前端「比对记录 → 外部调用」tab），
 或全局 `GET /api/v1/external-calls`（支持按端点/状态码/单据号筛选）。
@@ -614,6 +619,8 @@ curl -X POST 'https://compare.example.com/api/v1/external/amountStat' \
 ```
 
 > **算术确定性**：`grand_total` 与各级合计始终由代码用 `Decimal` 求和；LLM 仅在正则启发式列定位失败时兜底指认金额列，抽出的每个金额必须能在 OCR 文本中逐字溯源，否则丢弃并标记 `needs_review`。详见 [金额统计方案](docs/金额统计方案.md)。
+
+> **多页发票**：同一 PDF 内，同一票号（传统发票包含发票代码）的多页使用唯一、明确的价税合计，只计入一次，避免每页重复合计造成翻倍。不同票号即使金额相同也分别统计；对帐单明细不按金额相等去重。多页发票缺少明确票号、同票号价税合计缺失或冲突时，无法确认的页/票暂不计入，并标记 `needs_review`、在 `reasons` 中说明原因，此时金额仅为已确认部分。单页发票保持原抽取流程，本规则不跨文件去重。
 
 #### 完成回调（异步模式 `callback_url` 非空时触发）
 
