@@ -4,7 +4,7 @@
   对每个 PDF:
     ① get_ocr_engine → TrustedPDFReader(原生优先 + 视觉 OCR 逐页降级)
     ② 抽取所有 label="table" 且 table is not None 的 Block
-    ③ merge_cross_page_tables 合并跨页续表
+    ③ 仅合并可确定性抽取的跨页续表;需 LLM 兜底的表保留物理页
     ④ 对每张表三级级联抽取金额:
        a. 启发式 detect_amount_columns 命中 → 代码求和(对帐单场景,免费确定)
        b. 启发式失败 + enable_llm_column_detection → llm_detect_amount_columns
@@ -12,7 +12,7 @@
        c. 列指认仍抽空(典型:发票纯数字无单位 + 表头乱码)→ llm_extract_amounts
           直接抽取数据行金额,逐值 grounding 校验(OCR 文本逐字溯源)通过后由
           代码累加
-    ⑤ 全文件仍无金额 → 多模态模型按整页图片重新核对,仍无可溯源数据则报错
+    ⑤ 逐页检查金额覆盖,未抽到金额的页按整页图片重新核对
   多文件聚合 → grand_total / grand_totals_by_column / verdict / reasons
 
 与现有 raw_pipeline 的关键区别:
@@ -31,6 +31,7 @@ from typing import Callable, Literal
 from .config import Settings, settings
 from .models import (
     Block,
+    PageRecognitionDiagnostic,
     StatementAmountItem,
     StatementFileSummary,
     StatementSummaryReport,
@@ -41,6 +42,7 @@ from .ocr import get_ocr_engine
 from .observability import record_ocr_result
 from .parsing.pdf import get_page_metas, render_page
 from .statement.amount_column import (
+    is_cross_page_continuation,
     merge_cross_page_tables,
     summarize_table,
 )
@@ -180,8 +182,12 @@ def _process_one_pdf(
             file_name, len(pages_blocks), len(tables_with_page), invoice_pages, page_block_summary,
         )
 
-        # 合并跨页续表
-        merged_tables = merge_cross_page_tables(tables_with_page)
+        # 仅确定性抽取的续表可合并。LLM 的图片与 grounding 是单页的,
+        # 提前合并需兜底的表会导致后续页金额无法溯源,或被第一页成功短路。
+        merged_tables, amount_pages = _merge_heuristic_tables(
+            tables_with_page, user_keywords=amount_column_keywords,
+        )
+        amount_pages.update(consolidated_pages)
 
         # 惰性按页渲染 PNG(LLM 兜底列指认/金额抽取用)。
         # OCR 引擎在 recognize 内已渲染过一次全部页面,此处只在兜底真正需要某页时
@@ -207,8 +213,6 @@ def _process_one_pdf(
             summary.table_index = index
             for item in summary.items:
                 item.table_index = index
-        recognition_needs_review = any(not d.reliable for d in diagnostics)
-
         for table_index, (table, page_index) in enumerate(merged_tables, start=len(table_summaries)):
             summary = _summarize_one_table(
                 table,
@@ -222,20 +226,20 @@ def _process_one_pdf(
                 page_groundings=page_groundings,
             )
             table_summaries.append(summary)
+            if _has_amounts(summary):
+                amount_pages.add(page_index)
 
-        # 最后一轮按整页图片核对。表格存在但列/金额抽取均失败时也必须运行；
-        # OCR 文本为空时先用多模态 OCR 重读页面，再以该文本作金额溯源依据。
-        if enable_llm_column_detection and not any(
-            _has_amounts(summary) for summary in table_summaries
-        ):
-            logger.info(
-                "statement whole-page fallback file=%s (no amounts, verify page image)",
-                file_name,
-            )
-            for page_index in range(len(page_metas)):
-                if page_index in consolidated_pages:
-                    continue
-                page_text = page_groundings.get(page_index, "")
+        # 按物理页核对,不能因其它页成功而跳过。已计入金额的页和已归并
+        # 发票页不再整页抽取,避免重复。OCR 文本为空则先重新 OCR 作溯源。
+        for page_index in range(len(page_metas)):
+            if page_index in amount_pages:
+                continue
+            page_text = page_groundings.get(page_index, "")
+            if enable_llm_column_detection:
+                logger.info(
+                    "statement whole-page fallback file=%s page=%s (no amounts, verify page image)",
+                    file_name, page_index,
+                )
                 png = render_page_png(page_index)
                 if not page_text.strip() and png:
                     try:
@@ -246,18 +250,37 @@ def _process_one_pdf(
                             "statement verification OCR failed file=%s page=%s: %s",
                             file_name, page_index, exc,
                         )
-                if not page_text or not page_text.strip():
-                    continue
-                whole_summary = _extract_whole_page_amounts(
-                    page_text,
-                    png=png,
-                    file_index=file_index,
-                    file_name=file_name,
-                    page_index=page_index,
-                    table_index=len(table_summaries),
-                )
-                if whole_summary is not None:
-                    table_summaries.append(whole_summary)
+                if page_text.strip():
+                    whole_summary = _extract_whole_page_amounts(
+                        page_text,
+                        png=png,
+                        file_index=file_index,
+                        file_name=file_name,
+                        page_index=page_index,
+                        table_index=len(table_summaries),
+                    )
+                    if whole_summary is not None and _has_amounts(whole_summary):
+                        # 整页核对成功替代本页抽空的表,避免留下已解决的失败标记。
+                        table_summaries = [
+                            ts for ts in table_summaries if ts.page_index != page_index
+                        ]
+                        table_summaries.append(whole_summary)
+                        amount_pages.add(page_index)
+                        continue
+
+            # 有内容但本页未取得可核验金额时,明确显示部分统计待复核。
+            if page_text.strip() or any(p == page_index for _, p in tables_with_page):
+                diagnostics.append(PageRecognitionDiagnostic(
+                    page_index=page_index, source="fallback", reliable=False,
+                    reasons=["本页未识别到可核验的金额，文件合计仅包含已确认部分，请人工复核"],
+                ))
+
+        # 整页兜底可能替换了抽空表,统一重排报告中的表序号。
+        for index, summary in enumerate(table_summaries):
+            summary.table_index = index
+            for item in summary.items:
+                item.table_index = index
+        recognition_needs_review = any(not d.reliable for d in diagnostics)
 
         # 单 PDF 合计(含税口径):用各表 tax_inclusive_total 而非所有 column_sums,
         # 避免把 amount+tax 重复计入(有含税列时也已排除不含税/税额)。
@@ -301,6 +324,46 @@ def _has_amounts(summary: StatementTableSummary) -> bool:
     "已处理完成",必须继续走 LLM 兜底。
     """
     return bool(summary.tax_inclusive_method and summary.column_sums)
+
+
+def _merge_heuristic_tables(
+    tables_with_page: list[tuple[TableStructure, int]],
+    *,
+    user_keywords: list[str] | None,
+) -> tuple[list[tuple[TableStructure, int]], set[int]]:
+    """合并确定性表格,保留需模型兜底的表及其单页图片/溯源边界。"""
+    merged: list[tuple[TableStructure, int]] = []
+    pending: list[tuple[TableStructure, int]] = []
+    amount_pages: set[int] = set()
+
+    def heuristic_summary(table: TableStructure, page_index: int) -> StatementTableSummary:
+        return summarize_table(
+            table, file_index=0, file_name="", table_index=0,
+            page_index=page_index, user_keywords=user_keywords,
+        )
+
+    def flush() -> None:
+        if not pending:
+            return
+        group = merge_cross_page_tables(pending)
+        merged.extend(group)
+        # pending 是单组续表。只有整组实际抽到金额,才把声明合计页也视为已处理。
+        if _has_amounts(heuristic_summary(*group[0])):
+            amount_pages.update(page for _, page in pending)
+        pending.clear()
+
+    for table, page_index in tables_with_page:
+        summary = heuristic_summary(table, page_index)
+        # 只有声明合计的续页也保留在确定性合并路径,不把合计行重复计入。
+        if _has_amounts(summary) or summary.declared_totals:
+            if pending and not is_cross_page_continuation(pending[0][0], table):
+                flush()
+            pending.append((table, page_index))
+        else:
+            flush()
+            merged.append((table, page_index))
+    flush()
+    return merged, amount_pages
 
 
 def _none_column_source(headers: list[str]) -> dict[str, Literal["none"]]:

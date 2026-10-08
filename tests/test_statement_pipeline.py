@@ -254,6 +254,135 @@ def test_cross_page_tables_merged(monkeypatch, tmp_path):
     assert report.grand_total == 100000.0
 
 
+@pytest.mark.parametrize("structured", [False, True])
+def test_four_page_pdf_fallback_runs_after_first_page_has_amounts(monkeypatch, tmp_path, structured):
+    """第一页已成功不能阻止其余页的整页核对（无表格或表格抽空）。"""
+    from document_comparison.models import StatementAmountItem
+    import document_comparison.statement_pipeline as sp
+    import document_comparison.statement.llm_column_detect as lcd
+    import document_comparison.statement.llm_amount_extract as lae
+
+    pdf_path = _make_real_pdf(tmp_path, num_pages=4)
+    pages = [[_make_table_block(["项目", "金额"], [["A", "100元"]])]]
+    for page_index in range(1, 4):
+        amount = (page_index + 1) * 100
+        pages.append([Block(
+            block_id=f"p{page_index}", page_index=page_index,
+            label="table" if structured else "text",
+            content=f"项目 B，收款 {amount}.00",
+            table=TableStructure(headers=["说明", "数值"], rows=[["B", f"{amount}.00"]]) if structured else None,
+        )])
+    _patch_get_ocr_engine(monkeypatch, _make_mock_reader(pages))
+    _patch_page_metas(monkeypatch, 4)
+    monkeypatch.setattr(sp, "render_page", lambda path, page_index, dpi=200: str(page_index).encode())
+    monkeypatch.setattr(lcd, "llm_detect_amount_columns", lambda *args, **kwargs: None)
+    verified_pages = []
+
+    def extract(png, headers, rows, grounding, **kw):
+        if headers != ["全文"]:
+            return []  # 模拟表格抽空，需整页核对。
+        page_index = kw["page_index"]
+        verified_pages.append(page_index)
+        amount = (page_index + 1) * 100
+        assert f"{amount}.00" in grounding
+        assert png == str(page_index).encode()
+        return [StatementAmountItem(column="金额", value=amount, **kw)]
+
+    monkeypatch.setattr(lae, "llm_extract_amounts", extract)
+    report = run_statement_pipeline([pdf_path], ["four-pages.pdf"])
+    assert report.grand_total == 1000
+    assert verified_pages == [1, 2, 3]
+    assert report.verdict == "clean"
+    assert [table.table_index for table in report.files[0].tables] == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize("first_page_heuristic", [False, True])
+def test_four_page_continuation_uses_each_pages_image_and_grounding(monkeypatch, tmp_path, first_page_heuristic):
+    """同表头续页不能合并后只把第一页图片/原文交给金额抽取。"""
+    from document_comparison.models import StatementAmountItem
+    import document_comparison.statement_pipeline as sp
+    import document_comparison.statement.llm_column_detect as lcd
+    import document_comparison.statement.llm_amount_extract as lae
+
+    pdf_path = _make_real_pdf(tmp_path, num_pages=4)
+    pages = []
+    for page_index in range(4):
+        cell = f"{(page_index + 1) * 100}.00"
+        if page_index == 0 and first_page_heuristic:
+            cell += "元"
+        pages.append([Block(
+            block_id=f"p{page_index}", page_index=page_index, label="table",
+            content=f"项目 | 金额\n明细{page_index} | {cell}",
+            table=TableStructure(headers=["项目", "金额"], rows=[[f"明细{page_index}", cell]]),
+        )])
+    _patch_get_ocr_engine(monkeypatch, _make_mock_reader(pages))
+    _patch_page_metas(monkeypatch, 4)
+    monkeypatch.setattr(sp, "render_page", lambda path, page_index, dpi=200: str(page_index).encode())
+    monkeypatch.setattr(lcd, "llm_detect_amount_columns", lambda *args, **kwargs: None)
+    extracted_pages = []
+
+    def extract(png, headers, rows, grounding, **kw):
+        page_index = kw["page_index"]
+        amount = (page_index + 1) * 100
+        assert png == str(page_index).encode()
+        assert f"{amount}.00" in grounding
+        extracted_pages.append(page_index)
+        # 只返回当前页可溯源金额；旧代码合并后的其他页金额不能通过溯源。
+        return [StatementAmountItem(column="金额", value=amount, **kw)]
+
+    monkeypatch.setattr(lae, "llm_extract_amounts", extract)
+    report = run_statement_pipeline([pdf_path], ["four-pages.pdf"])
+    assert report.grand_total == 1000
+    assert extracted_pages == list(range(1 if first_page_heuristic else 0, 4))
+    assert {item.page_index for table in report.files[0].tables for item in table.items} == {0, 1, 2, 3}
+
+
+def test_four_page_heuristic_continuation_and_total_are_not_extracted_twice(monkeypatch, tmp_path):
+    """续表的每页已纳入代码合计,最后一页只有声明合计也不再整页抽取。"""
+    import document_comparison.statement_pipeline as sp
+
+    pdf_path = _make_real_pdf(tmp_path, num_pages=4)
+    pages = [[_make_table_block(
+        ["项目", "金额"], [["明细", f"{(i + 1) * 100}元"]], page_index=i,
+    )] for i in range(3)]
+    pages.append([_make_table_block(["项目", "金额"], [["合计", "600元"]], page_index=3)])
+    _patch_get_ocr_engine(monkeypatch, _make_mock_reader(pages))
+    _patch_page_metas(monkeypatch, 4)
+    render = MagicMock(side_effect=AssertionError("确定性续表不应进入图片兜底"))
+    monkeypatch.setattr(sp, "render_page", render)
+
+    report = run_statement_pipeline([pdf_path], ["four-pages.pdf"])
+    assert report.grand_total == 600
+    assert report.total_tables == 1
+    assert report.files[0].tables[0].totals_match == {"金额": True}
+    assert report.verdict == "clean"
+    render.assert_not_called()
+
+
+@pytest.mark.parametrize("enable_fallback", [False, True])
+def test_unresolved_later_page_marks_partial_amount_for_review(monkeypatch, tmp_path, enable_fallback):
+    """后续页无法核验时不能把第一页金额当作完整文件金额标 clean。"""
+    import document_comparison.statement_pipeline as sp
+    import document_comparison.statement.llm_amount_extract as lae
+
+    pdf_path = _make_real_pdf(tmp_path, num_pages=2)
+    pages = [[_make_table_block(["项目", "金额"], [["A", "100元"]])], [Block(
+        block_id="p1", page_index=1, label="text", content="收款金额 200.00",
+    )]]
+    _patch_get_ocr_engine(monkeypatch, _make_mock_reader(pages))
+    _patch_page_metas(monkeypatch, 2)
+    monkeypatch.setattr(sp, "render_page", lambda *args: b"fake-png")
+    monkeypatch.setattr(lae, "llm_extract_amounts", lambda *args, **kwargs: [])
+
+    report = run_statement_pipeline(
+        [pdf_path], ["partial.pdf"], enable_llm_column_detection=enable_fallback,
+    )
+    assert report.grand_total == 100
+    assert report.verdict == "needs_review"
+    assert report.files[0].recognition_status == "needs_review"
+    assert any("第 2 页" in reason and "已确认部分" in reason for reason in report.reasons)
+
+
 def test_multiple_tables_same_page(monkeypatch, tmp_path):
     """单页两张表(不同 headers)各自统计,不被合并。"""
     pdf_path = _make_real_pdf(tmp_path, "a.pdf", num_pages=1)
