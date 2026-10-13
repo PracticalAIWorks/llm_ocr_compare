@@ -13,9 +13,11 @@
 """
 from __future__ import annotations
 
+import html
 import json
 import logging
 import re
+import unicodedata
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -251,13 +253,14 @@ def _format_rows(headers: list[str], rows: list[list[str]]) -> str:
 
 
 def _normalize_for_grounding(text: str) -> str:
-    """grounding 比对用的归一化:去千分位分隔符(半/全角逗号)与所有空白。
+    """grounding 比对用的归一化:解码 HTML、统一全角数字和标点、去千分位与空白。
 
     使 "1,680.00" 与 OCR 文本 "1,680.00" / "1680.00" 能互相匹配。
     """
     if not text:
         return ""
-    return re.sub(r"[\s,，]+", "", str(text))
+    normalized = unicodedata.normalize("NFKC", html.unescape(str(text)))
+    return re.sub(r"[\s,，]+", "", normalized)
 
 
 def _canonicalize_amount(raw: str) -> tuple[str, float] | None:
@@ -266,7 +269,7 @@ def _canonicalize_amount(raw: str) -> tuple[str, float] | None:
     复用 elements._parse_decimal(去千分位/空白)与 _canonical_amount(按"元")。
     负数/不可解析返回 None。
     """
-    number = _elements._parse_decimal(raw)
+    number = _elements._parse_decimal(_normalize_for_grounding(raw))
     if number is None:
         return None
     if number < 0:

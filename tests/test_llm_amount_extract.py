@@ -5,7 +5,10 @@ mock LLMOCREngine._post_chat,验证:
   - 非 JSON / 字段非法 / 调用异常 → None/空
 不发起真实网络请求。
 """
+import json
 from unittest.mock import MagicMock
+
+import pytest
 
 from document_comparison.statement import llm_amount_extract as lae
 
@@ -50,6 +53,30 @@ def test_thousand_separator_grounding(monkeypatch):
         b"fake-png", ["金额"], [["1,680.00"]], grounding,
     )
     assert items and items[0].value == 1680.0
+
+
+@pytest.mark.parametrize("grounding", [
+    "金额 １，５００．００ １２９８．００ ４７２．００",
+    "<td>1&#44;500.00</td><td>1&#50;98.00</td><td>4&#55;2.00</td>",
+])
+@pytest.mark.parametrize("first_amount", ["1500", "１，５００．００"])
+def test_second_page_amounts_grounding_normalizes_ocr_format(monkeypatch, grounding, first_amount):
+    _patch_post_chat(monkeypatch, json.dumps({"items": [
+        {"amount": first_amount}, {"amount": "1298"}, {"amount": "472"},
+    ]}))
+    items = lae.llm_extract_amounts(
+        b"fake-png", ["全文"], [[grounding]], grounding, page_index=1,
+    )
+    assert items is not None
+    assert [item.value for item in items] == [1500, 1298, 472]
+
+
+def test_other_page_amount_not_grounded_by_current_table(monkeypatch):
+    _patch_post_chat(monkeypatch, '{"items": [{"amount": "1500"}]}')
+    items = lae.llm_extract_amounts(
+        b"fake-png", ["金额"], [["1298"]], "金额 1298", page_index=1,
+    )
+    assert items == []
 
 
 def test_grounding_reject_hallucinated(monkeypatch):

@@ -359,6 +359,43 @@ def test_four_page_heuristic_continuation_and_total_are_not_extracted_twice(monk
     render.assert_not_called()
 
 
+@pytest.mark.parametrize("cell_format", ["{amount}", "{amount:.2f}"])
+def test_second_page_ocr_cells_ground_model_amounts(monkeypatch, tmp_path, cell_format):
+    """OCR 的 content 仅为表格描述时,结构化单元格仍是本页溯源依据。"""
+    import document_comparison.statement_pipeline as sp
+    import document_comparison.statement.llm_column_detect as lcd
+
+    pdf_path = _make_real_pdf(tmp_path, num_pages=2)
+    first = _make_table_block(["项目", "金额"], [["第一页", "100元"]])
+    second = _make_table_block(
+        ["项目", "金额(含税)"],
+        [[name, cell_format.format(amount=amount)] for name, amount in
+         [("A", 1500), ("B", 1298), ("C", 472), ("合计", 3270)]],
+        page_index=1,
+    )
+    second.content = "对账单续表，共三条明细及合计行"
+    _patch_get_ocr_engine(monkeypatch, _make_mock_reader([[first], [second]]))
+    _patch_page_metas(monkeypatch, 2)
+    monkeypatch.setattr(sp, "render_page", lambda *args: b"fake-png")
+    monkeypatch.setattr(lcd, "llm_detect_amount_columns", lambda *args, **kw: None)
+    calls = []
+
+    def post(self, payload, kind):
+        assert kind == "statement-amount"
+        calls.append(payload)
+        return '\n\n{"items": [{"amount": "1500"}, {"amount": "1298"}, {"amount": "472"}]}'
+
+    monkeypatch.setattr("document_comparison.ocr.llm.LLMOCREngine._post_chat", post)
+    report = run_statement_pipeline([pdf_path], ["statement.pdf"])
+    assert report.grand_total == 3370
+    assert report.total_items == 4
+    assert report.verdict == "clean"
+    items = report.files[0].tables[1].items
+    assert [item.value for item in items] == [1500, 1298, 472]
+    assert all(item.page_index == 1 for item in items)
+    assert len(calls) == 1  # 成功后不能整页重复计入
+
+
 @pytest.mark.parametrize("enable_fallback", [False, True])
 def test_unresolved_later_page_marks_partial_amount_for_review(monkeypatch, tmp_path, enable_fallback):
     """后续页无法核验时不能把第一页金额当作完整文件金额标 clean。"""

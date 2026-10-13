@@ -543,6 +543,14 @@ def _llm_extract_amount_items(
     # 延迟导入(LLM 引擎实例化需要 api_base 配置)
     from .statement.llm_amount_extract import llm_extract_amounts
 
+    # OCR 的 content 可能仅含表格描述,完整数值保存在 table.headers/rows。
+    # 当前物理页的原始单元格同样是 OCR 溯源证据,不能因缺少文本副本而丢弃。
+    grounding = "\n".join([
+        page_groundings,
+        " | ".join(table.headers),
+        *(" | ".join(str(cell or "") for cell in row) for row in table.rows),
+    ])
+
     try:
         logger.info(
             "statement amount fallback file_index=%s table_index=%s page_index=%s header_count=%s row_count=%s",
@@ -552,7 +560,7 @@ def _llm_extract_amount_items(
             png,
             list(table.headers),
             list(table.rows),
-            page_groundings,
+            grounding,
             file_index=file_index,
             file_name=file_name,
             table_index=table_index,
