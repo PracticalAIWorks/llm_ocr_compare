@@ -632,6 +632,14 @@ def _headers_to_dict(scope_or_raw) -> dict[str, str]:
     return out
 
 
+def _compare_report_with_document_no(data, document_no: str | None) -> TamperReport:
+    """旧报告 JSONB 缺少单据编号时，从任务元数据补齐。"""
+    report = TamperReport.model_validate(data)
+    if not report.document_no and document_no:
+        report = report.model_copy(update={"document_no": document_no})
+    return report
+
+
 def _task_record_to_task_info_dict(rec, *, kind: str) -> dict:
     """把 PG TaskRecord 还原成 TaskInfo.model_dump 形状,附加对应报告字段。
 
@@ -649,7 +657,9 @@ def _task_record_to_task_info_dict(rec, *, kind: str) -> dict:
         "elapsed": rec.elapsed,
     }
     if kind == "compare" and rec.report_compare is not None:
-        base["report"] = TamperReport.model_validate(rec.report_compare).model_dump()
+        base["report"] = _compare_report_with_document_no(
+            rec.report_compare, rec.document_no
+        ).model_dump()
     elif kind == "raw" and rec.report_raw is not None:
         base["raw_report"] = rec.report_raw
     elif kind == "statement" and rec.report_statement is not None:
@@ -2167,13 +2177,15 @@ def create_app() -> FastAPI:
             return resp
         resp = task.info.model_dump()
         if task.info.status == "done" and task.report is not None:
-            resp["report"] = task.report.model_dump()
+            resp["report"] = _compare_report_with_document_no(
+                task.report, task.document_no
+            ).model_dump()
         elif task.info.status == "done":
             # 内存里 report 还没就绪时,从 PG JSONB 回捞。
             rec = await asyncio.to_thread(db_repo.get_task, task_id)
             if rec is not None and rec.report_compare is not None:
-                resp["report"] = TamperReport.model_validate(
-                    rec.report_compare
+                resp["report"] = _compare_report_with_document_no(
+                    rec.report_compare, rec.document_no
                 ).model_dump()
         return resp
 
@@ -2212,9 +2224,10 @@ def create_app() -> FastAPI:
             # 从 PG JSONB 还原(进程重启或内存未就绪)
             rec = await asyncio.to_thread(db_repo.get_task, task_id)
             if rec is not None and rec.report_compare is not None:
-                report = TamperReport.model_validate(rec.report_compare)
+                report = _compare_report_with_document_no(rec.report_compare, rec.document_no)
         if report is None:
             raise HTTPException(404, "report not ready")
+        report = _compare_report_with_document_no(report, task.document_no if task else None)
 
         if format == "json":
             return JSONResponse(content=report.model_dump())
@@ -2264,11 +2277,11 @@ def create_app() -> FastAPI:
         html_path = await asyncio.to_thread(
             write_external_html_report,
             task_id,
-            (task.document_no if task else "") or task_id,
+            report.document_no or "",
             report,
         )
         filename = external_report_filename(
-            (task.document_no if task else "") or task_id,
+            report.document_no or task_id,
             None,
         )
         from urllib.parse import quote
@@ -2296,12 +2309,13 @@ def create_app() -> FastAPI:
             # 从 PG JSONB 还原(进程重启或内存未就绪)
             rec = await asyncio.to_thread(db_repo.get_task, task_id)
             if rec is not None and rec.report_compare is not None:
-                report = TamperReport.model_validate(rec.report_compare)
+                report = _compare_report_with_document_no(rec.report_compare, rec.document_no)
             if document_no is None and rec is not None:
                 document_no = rec.document_no
         if report is None:
             raise HTTPException(404, "report not ready")
-        document_no = document_no or task_id
+        report = _compare_report_with_document_no(report, document_no)
+        document_no = report.document_no or ""
 
         path = external_pdf_report_path(task_id)
         if not path.is_file():
@@ -2324,7 +2338,7 @@ def create_app() -> FastAPI:
         return _attachment_file_response(
             path,
             "application/pdf",
-            external_report_filename(document_no, None, suffix=".pdf"),
+            external_report_filename(document_no or task_id, None, suffix=".pdf"),
         )
 
     @app.get(

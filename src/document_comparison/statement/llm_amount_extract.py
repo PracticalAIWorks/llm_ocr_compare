@@ -6,8 +6,8 @@
 
 严格护栏(贯彻 AGENTS.md「确定性优先,LLM 辅助;不可让 LLM 做算术」):
   - LLM **只抽数据行的金额数值**,不做求和、不做任何计算。
-  - 抽出的每个金额必须通过 **grounding 校验**:在 OCR 识别出的页面文本里能逐字
-    溯源(数字归一化后子串包含),否则丢弃。这把"模型幻觉"挡在确定性结论之外。
+  - 每个可解析金额都保留;OCR 能匹配的标 matched,未匹配的标 unmatched,
+    供调用方将含候选金额的合计标为待复核,避免 OCR 漏识别导致补漏失效。
   - 求和仍由代码完成(调用方把本函数返回的 items 累加进 column_sums)。
   - 合计行的金额不在此抽取(合计行已在 amount_column.is_total_row 处理为 declared_totals)。
 """
@@ -34,16 +34,18 @@ _SYSTEM_PROMPT = (
     "有可读取的价税合计/含税金额列时,只抽这一列。"
     "没有可读取的含税金额列,但有金额(不含税)和税额两列时,两列的数据行数值都要抽出,由程序相加。"
     "只有金额列且没有税额列时,抽金额列。不要把已付/未付或合计行重复计入。"
+    "折扣、冲销、退货和红字发票的负数金额及负数税额都是有效数据,必须逐项抽取并保留原始负号,不能跳过或取绝对值。"
     "不要抽数量、单价、税率、百分比、日期、行号、编号。"
 )
 
 _USER_PROMPT_TEMPLATE = (
     "表格表头如下:\n{headers_block}\n\n"
     "表格数据(每行用 | 分隔):\n{rows_block}\n\n"
-    "下方是本页 OCR 识别出的原文,你返回的每个金额必须能在其中逐字找到:\n"
+    "下方是本页 OCR 识别出的原文,供你核对;OCR 可能漏掉图片中可见的金额,不要因此遗漏数据行:\n"
     "---BEGIN GROUNDING---\n{grounding}\n---END GROUNDING---\n\n"
     "请只返回 JSON,格式为 {{\"items\": [{{\"amount\": \"1680.00\"}}]}}。"
-    "amount 为含税金额数字字符串(可含千分位/小数,不要带 ¥/元 等符号)。"
+    "amount 为含税金额数字字符串(可含正负号、千分位和小数,不要带 ¥/元 等货币符号)。"
+    "负数行必须抽取并保留负号,例如 {{\"amount\": \"-100.00\"}},不得漏掉负数金额或负数税额。"
     "优先只抽含税/价税合计列的数据行金额,跳过合计/小计行;"
     "仅当没有可读取的含税列时,若有金额(不含税)与税额两列,两列均逐项抽取,不要遗漏税额;"
     "若有含税列则不要再抽金额(不含税)和税额,避免重复;"
@@ -69,10 +71,10 @@ def llm_extract_amounts(
         png_bytes: 表格所在页 PNG(视觉上下文,辅助列对齐)。
         headers: 表头列表。
         rows: 该表数据行(让模型聚焦目标表,而非整页)。
-        grounding_text: 该页 OCR 文本(所有 block.content 拼接),用作逐字溯源。
+        grounding_text: 该页 OCR 文本与表格单元格,用于给抽取值标注核对状态。
 
     Returns:
-        通过 grounding 校验的 ``StatementAmountItem`` 列表;调用/解析失败返回 None
+        带 grounding 状态的 ``StatementAmountItem`` 列表;调用/解析失败返回 None
         (调用方标 needs_review);空 list 表示无金额(调用方据此标 none)。
     """
     if not png_bytes:
@@ -170,11 +172,11 @@ def _parse_amount_response(
     table_index: int,
     page_index: int,
 ) -> list[StatementAmountItem] | None:
-    """解析 LLM 返回的 JSON,产出通过 grounding 校验的 items。
+    """解析 LLM 返回的 JSON,保留可解析金额并标注 OCR 核对状态。
 
     格式约束:{"items": [{"amount": "1680.00"}, ...]}。
-    每条 amount 经 _parse_decimal 归一化后必须在 grounding_text(同样归一化)中
-    能逐字溯源,否则丢弃该条;JSON 不合法返回 None。
+    每条 amount 经 _parse_decimal 归一化后与 grounding_text 比对;
+    未匹配仍保留为待复核候选。JSON 不合法返回 None。
     """
     if not content:
         return None
@@ -209,15 +211,15 @@ def _parse_amount_response(
         if canonical_value is None:
             continue
         canonical, value = canonical_value
-        # grounding 校验:归一化后的金额数字必须在 OCR 文本里逐字出现
+        # OCR 未匹配可能是模型误识别,也可能是 OCR 漏识别;保留并交给报告复核。
         norm_amount = _normalize_for_grounding(amount)
-        if norm_amount not in norm_grounding:
+        matched = norm_amount in norm_grounding
+        if not matched:
             logger.info(
-                "llm amount extract grounding reject file_index=%s table_index=%s "
+                "llm amount extract grounding unmatched file_index=%s table_index=%s "
                 "amount=%s (not found in page text)",
                 file_index, table_index, log_value_summary(amount),
             )
-            continue
         items.append(
             StatementAmountItem(
                 file_index=file_index,
@@ -230,6 +232,7 @@ def _parse_amount_response(
                 raw_cell=amount[:200],
                 canonical=canonical,
                 value=value,
+                grounding_status="matched" if matched else "unmatched",
             )
         )
     return items
@@ -253,13 +256,13 @@ def _format_rows(headers: list[str], rows: list[list[str]]) -> str:
 
 
 def _normalize_for_grounding(text: str) -> str:
-    """grounding 比对用的归一化:解码 HTML、统一全角数字和标点、去千分位与空白。
+    """grounding 比对用的归一化:解码 HTML、统一全角数字/标点/负号、去千分位与空白。
 
     使 "1,680.00" 与 OCR 文本 "1,680.00" / "1680.00" 能互相匹配。
     """
     if not text:
         return ""
-    normalized = unicodedata.normalize("NFKC", html.unescape(str(text)))
+    normalized = unicodedata.normalize("NFKC", html.unescape(str(text))).replace("−", "-")
     return re.sub(r"[\s,，]+", "", normalized)
 
 
@@ -267,12 +270,10 @@ def _canonicalize_amount(raw: str) -> tuple[str, float] | None:
     """把 LLM 返回的金额字符串归一化为 (canonical, value)。
 
     复用 elements._parse_decimal(去千分位/空白)与 _canonical_amount(按"元")。
-    负数/不可解析返回 None。
+    保留正负号;不可解析或非有限数返回 None。
     """
     number = _elements._parse_decimal(_normalize_for_grounding(raw))
-    if number is None:
-        return None
-    if number < 0:
+    if number is None or not number.is_finite():
         return None
     canonical = _elements._canonical_amount(number, "元")
     try:

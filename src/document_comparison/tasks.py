@@ -694,6 +694,7 @@ class TaskManager:
                         # request/failure attempt,否则历史页看不到模型/OCR记录。
                         await self._save_llm_calls(task_id, llm_calls)
             await self._raise_if_stop_requested(task)
+            report.document_no = task.document_no
             task.report = report
             await self._db_thread(
                 db_repo.save_compare_report, task_id, report

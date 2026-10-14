@@ -65,11 +65,26 @@ def test_render_pdf_report_basic_fields(tmp_path):
     text = "".join(page.get_text() for page in doc)
     assert "合同比对报告" in text
     assert "BILL-001" in text
+    assert "单据编号:" in text
     assert "发现确认内容变化" in text  # change_status→中文
     assert "2026-08-07 15:30" in text
     assert "差异数量:1" in text
     assert "第三条 金额" in text
     doc.close()
+
+
+def test_pdf_report_document_no_from_report_and_missing_placeholder(tmp_path):
+    report = TamperReport(source="s", target="t", document_no="单据-001")
+    out = tmp_path / "report.pdf"
+    render_pdf_report("", report, datetime.now(timezone.utc), out)
+    with pymupdf.open(out) as doc:
+        text = "".join(page.get_text() for page in doc)
+        assert "单据编号:单据-001" in text
+    report.document_no = None
+    render_pdf_report("", report, datetime.now(timezone.utc), out)
+    with pymupdf.open(out) as doc:
+        text = "".join(page.get_text() for page in doc)
+        assert "单据编号:—" in text
 
 
 def test_render_pdf_report_discloses_discarded_drawing_pages(tmp_path):

@@ -204,6 +204,7 @@ function onSelectClause(id: string) {
         </section>
 
         <section class="card report-meta">
+          <div><b>单据编号:</b> {{ reportStore.report.document_no || '—' }}</div>
           <div><b>任务编号:</b> {{ taskId }}</div>
           <div><b>结论:</b> <span :class="['verdict-badge', `verdict-${reportStore.report.change_status}`]">{{ changeStatusText }}</span></div>
           <div><b>识别状态:</b> {{ reportStore.report.recognition_status === 'reliable' ? '可靠' : '待人工复核' }}</div>

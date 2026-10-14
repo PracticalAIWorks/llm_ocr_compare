@@ -40,10 +40,19 @@ def test_render_html_report_basic_fields():
     html = render_html_report("BILL-001", report, generated)
 
     assert "<!DOCTYPE html>" in html
-    assert "单据号:</b>BILL-001" in html
+    assert "单据编号:</b>BILL-001" in html
     assert "发现确认内容变化" in html  # change_status→中文
     assert "生成时间:</b>2026-08-07 15:30" in html
     assert "差异数量:</b>1" in html
+
+
+def test_html_report_document_no_from_report_and_missing_placeholder():
+    report = TamperReport(source="s", target="t", document_no="单据<001>")
+    generated = datetime.now(timezone.utc)
+    rendered = render_html_report("", report, generated)
+    assert "单据编号:</b>单据&lt;001&gt;" in rendered
+    report.document_no = None
+    assert "单据编号:</b>—" in render_html_report("", report, generated)
 
 
 def test_render_html_report_discloses_discarded_drawing_pages():

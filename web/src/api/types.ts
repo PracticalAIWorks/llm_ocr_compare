@@ -106,6 +106,7 @@ export interface TruncationRecord {
 export interface TamperReport {
   source: string
   target: string
+  document_no: string | null
   overall_risk: OverallRisk
   change_status: ChangeVerdict
   summary: Record<string, unknown>
@@ -229,6 +230,8 @@ export interface StatementAmountItem {
   raw_cell: string
   canonical: string
   value: number
+  /** LLM 金额在本页 OCR 文本/表格单元格中的匹配状态;null 表示非 LLM 抽取 */
+  grounding_status?: 'matched' | 'unmatched' | null
 }
 
 export interface StatementTableSummary {

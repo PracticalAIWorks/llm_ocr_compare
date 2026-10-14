@@ -332,6 +332,7 @@ class TamperReport(BaseModel):
 
     source: str
     target: str
+    document_no: str | None = Field(default=None, description="提交任务时携带的单据编号")
     overall_risk: OverallRisk = "clean"
     change_status: ChangeVerdict = Field(
         default="clean",
@@ -486,9 +487,13 @@ class StatementAmountItem(BaseModel):
     row_index: int = Field(default=0, description="表格内行号(0 基)")
     row_label: str = Field(default="", description="首列单元格内容,用于标识本行")
     column: str = Field(default="", description="金额列名(启发式或 LLM 指认)")
-    raw_cell: str = Field(default="", description="OCR 原始单元格文本")
+    raw_cell: str = Field(default="", description="OCR 原始单元格文本或 LLM 返回的原始金额")
     canonical: str = Field(default="", description='canonical 形式,如 "CNY:30000.00"')
     value: float = Field(default=0.0, description="解析后数值(单位元)")
+    grounding_status: Literal["matched", "unmatched"] | None = Field(
+        default=None,
+        description="LLM 抽取金额与本页 OCR 文本/表格单元格的核对结果;None 表示非 LLM 抽取",
+    )
 
 
 class StatementTableSummary(BaseModel):

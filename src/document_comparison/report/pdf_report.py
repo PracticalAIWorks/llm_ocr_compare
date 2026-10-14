@@ -418,7 +418,7 @@ def render_pdf_report(
     )
     layout.y += 40
 
-    _meta_line(layout, "单据号", document_no)
+    _meta_line(layout, "单据编号", document_no or report.document_no or "—")
     _meta_line(layout, "结论", conclusion, value_color=conclusion_color)
     _meta_line(layout, "识别状态", recognition)
     _meta_line(layout, "高亮定位", location)

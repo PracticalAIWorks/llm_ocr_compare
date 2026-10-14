@@ -290,7 +290,7 @@ def render_html_report(
 <body>
 <h1>合同比对报告</h1>
 <div class="meta">
-  <div><b>单据号:</b>{html.escape(document_no)}</div>
+  <div><b>单据编号:</b>{html.escape(document_no or report.document_no or '—')}</div>
   <div><b>结论:</b>{html.escape(conclusion)}</div>
   <div><b>识别状态:</b>{html.escape(recognition)}</div>
   <div><b>高亮定位:</b>{html.escape(location)}</div>
