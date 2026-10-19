@@ -1,11 +1,14 @@
 """金额统计 — LLM 兜底金额抽取单元测试。
 
 mock LLMOCREngine._post_chat,验证:
-  - 发票纯数字金额抽取 + grounding 校验通过/拒绝
+  - 发票纯数字金额抽取 + OCR 匹配/未匹配状态
   - 非 JSON / 字段非法 / 调用异常 → None/空
 不发起真实网络请求。
 """
+import json
 from unittest.mock import MagicMock
+
+import pytest
 
 from document_comparison.statement import llm_amount_extract as lae
 
@@ -18,7 +21,7 @@ def _patch_post_chat(monkeypatch, fake_content):
     )
 
 
-# —— grounding 通过 / 拒绝 ——
+# —— OCR 核对状态 ——
 
 def test_extract_invoice_amounts_grounding_pass(monkeypatch):
     """发票纯数字金额,在 OCR 文本里能逐字溯源 → 抽取成功。"""
@@ -39,6 +42,7 @@ def test_extract_invoice_amounts_grounding_pass(monkeypatch):
     assert items[0].canonical.startswith("CNY:")
     # 列名应取表头里的"金额"
     assert all(it.column == "金额" for it in items)
+    assert all(it.grounding_status == "matched" for it in items)
 
 
 def test_thousand_separator_grounding(monkeypatch):
@@ -52,21 +56,47 @@ def test_thousand_separator_grounding(monkeypatch):
     assert items and items[0].value == 1680.0
 
 
-def test_grounding_reject_hallucinated(monkeypatch):
-    """LLM 编造 OCR 文本里没有的金额 → grounding 拒绝 → 空 list。"""
+@pytest.mark.parametrize("grounding", [
+    "金额 １，５００．００ １２９８．００ ４７２．００",
+    "<td>1&#44;500.00</td><td>1&#50;98.00</td><td>4&#55;2.00</td>",
+])
+@pytest.mark.parametrize("first_amount", ["1500", "１，５００．００"])
+def test_second_page_amounts_grounding_normalizes_ocr_format(monkeypatch, grounding, first_amount):
+    _patch_post_chat(monkeypatch, json.dumps({"items": [
+        {"amount": first_amount}, {"amount": "1298"}, {"amount": "472"},
+    ]}))
+    items = lae.llm_extract_amounts(
+        b"fake-png", ["全文"], [[grounding]], grounding, page_index=1,
+    )
+    assert items is not None
+    assert [item.value for item in items] == [1500, 1298, 472]
+
+
+def test_other_page_amount_not_grounded_by_current_table(monkeypatch):
+    _patch_post_chat(monkeypatch, '{"items": [{"amount": "1500"}]}')
+    items = lae.llm_extract_amounts(
+        b"fake-png", ["金额"], [["1298"]], "金额 1298", page_index=1,
+    )
+    assert items and items[0].value == 1500
+    assert items[0].grounding_status == "unmatched"
+
+
+def test_grounding_keeps_unmatched_candidate(monkeypatch):
+    """OCR 未匹配可能是漏识别:保留候选金额,但标记待复核。"""
     fake = '{"items": [{"amount": "99999.00"}]}'  # OCR 文本里没有 99999
     _patch_post_chat(monkeypatch, fake)
     grounding = "金额\n1680.00"  # 只有 1680
     items = lae.llm_extract_amounts(
         b"fake-png", ["金额"], [["1680.00"]], grounding,
     )
-    assert items == []
+    assert items and items[0].value == 99999.0
+    assert items[0].grounding_status == "unmatched"
 
 
-def test_grounding_reject_unrelated_number(monkeypatch):
+def test_grounding_marks_unrelated_number(monkeypatch):
     """grounding 通过但模型误抽(数量/单价不应被抽)——本测试只验 grounding 逻辑:
     OCR 文本里含的数会通过 grounding,但 prompt 已要求排除非金额列;
-    这里确认一个确实不在原文的值会被拒。"""
+    这里确认一个确实不在原文的值会被标为未匹配。"""
     fake = '{"items": [{"amount": "85.00"}, {"amount": "12345.00"}]}'
     _patch_post_chat(monkeypatch, fake)
     grounding = "数量 单价 金额\n20 85.00 1680.00"  # 85 在,12345 不在
@@ -74,10 +104,10 @@ def test_grounding_reject_unrelated_number(monkeypatch):
         b"fake-png", ["数量", "单价", "金额"],
         [["20", "85.00", "1680.00"]], grounding,
     )
-    # 只有 85.00 通过 grounding,12345.00 被拒
+    # 85.00 匹配,12345.00 作为候选金额保留并标未匹配
     assert items is not None
-    assert len(items) == 1
-    assert items[0].value == 85.0
+    assert [it.value for it in items] == [85.0, 12345.0]
+    assert [it.grounding_status for it in items] == ["matched", "unmatched"]
 
 
 # —— 容错 / 降级 ——
@@ -112,15 +142,39 @@ def test_non_string_amount_filtered(monkeypatch):
     assert items[0].value == 640.0
 
 
-def test_negative_amount_filtered(monkeypatch):
-    """负数金额被拒。"""
-    fake = '{"items": [{"amount": "-1680.00"}]}'
-    _patch_post_chat(monkeypatch, fake)
-    grounding = "-1680.00"
+@pytest.mark.parametrize("amount,grounding", [
+    ("-1680.00", "折扣 -1680.00"),
+    ("-1,680.00", "冲销 - 1,680.00"),
+    ("-1680.00", "红字 −1680.00"),
+    ("− 1,680.00", "红字 -1680.00"),
+    ("－１，６８０．００", "红字 －１，６８０．００"),
+])
+def test_negative_amount_preserved(monkeypatch, amount, grounding):
+    """折扣/冲销/红字负数须保留负号,按带符号 OCR 原文溯源。"""
+    _patch_post_chat(monkeypatch, json.dumps({"items": [{"amount": amount}]}))
     items = lae.llm_extract_amounts(
-        b"fake-png", ["金额"], [["-1680.00"]], grounding,
+        b"fake-png", ["金额"], [[grounding]], grounding,
     )
-    assert items == []
+    assert items and items[0].value == -1680.0
+    assert items[0].canonical == "CNY:-1680"
+    assert items[0].raw_cell == amount
+
+
+def test_negative_amount_requires_negative_grounding(monkeypatch):
+    _patch_post_chat(monkeypatch, '{"items": [{"amount": "-1680.00"}]}')
+    items = lae.llm_extract_amounts(
+        b"fake-png", ["金额"], [["1680.00"]], "金额 1680.00",
+    )
+    assert items and items[0].value == -1680.0
+    assert items[0].grounding_status == "unmatched"
+
+
+@pytest.mark.parametrize("amount", ["NaN", "-NaN", "Infinity", "-Infinity"])
+def test_nonfinite_amount_filtered(monkeypatch, amount):
+    _patch_post_chat(monkeypatch, json.dumps({"items": [{"amount": amount}]}))
+    assert lae.llm_extract_amounts(
+        b"fake-png", ["金额"], [[amount]], amount,
+    ) == []
 
 
 def test_call_exception_returns_none(monkeypatch):

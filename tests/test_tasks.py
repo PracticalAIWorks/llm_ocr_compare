@@ -59,6 +59,11 @@ async def test_external_task_callback_contract(monkeypatch):
     ):
         monkeypatch.setattr(tasks_module.db_repo, name, lambda *_a, **_kw: None)
 
+    saved_document_nos: list[str | None] = []
+    monkeypatch.setattr(
+        tasks_module.db_repo, "save_compare_report",
+        lambda _task_id, saved_report: saved_document_nos.append(saved_report.document_no),
+    )
     callback_results: list[dict] = []
 
     def _update_callback_result(task_id_, *, success, http_status=None, error=None):
@@ -91,6 +96,8 @@ async def test_external_task_callback_contract(monkeypatch):
 
     await manager.run(task_id, "source.docx", "target.pdf")
 
+    assert report.document_no == "BILL-1"
+    assert saved_document_nos == ["BILL-1"]
     body = delivered["body"]
     assert body["event_type"] == "contract.compare.completed"
     assert body["task_id"] == task_id

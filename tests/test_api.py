@@ -349,7 +349,8 @@ def test_preview_and_annotated_report_use_truncated_task_pdf(client, monkeypatch
         assert len(doc) == 1
 
 
-def test_html_report_download_embeds_highlight_pages_and_clause_navigation(client, monkeypatch, tmp_path):
+@pytest.mark.parametrize("from_history", [False, True])
+def test_html_report_download_embeds_highlight_pages_and_clause_navigation(client, monkeypatch, tmp_path, from_history):
     """Web HTML 导出复用已验证坐标，表格行可跳转到对应高亮页。"""
     try:
         import pymupdf as fitz
@@ -383,10 +384,16 @@ def test_html_report_download_embeds_highlight_pages_and_clause_navigation(clien
         )],
     )
 
+    if from_history:
+        from document_comparison.db import repository as db_repo
+        db_repo.save_compare_report(task_id, task.report)
+        task_manager._tasks.clear()
+
     response = client.get(f"/api/v1/compare/{task_id}/report?format=html")
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
+    assert "单据编号:</b>WEB-HTML-001" in response.text
     assert "attachment;" in response.headers["content-disposition"]
     assert 'data-target-page="1"' in response.text
     assert 'data-source-page="1"' in response.text
@@ -395,7 +402,8 @@ def test_html_report_download_embeds_highlight_pages_and_clause_navigation(clien
     assert "row.dataset.targetPage" in response.text
 
 
-def test_pdf_report_download_generates_then_reuses(client, monkeypatch, tmp_path):
+@pytest.mark.parametrize("from_history", [False, True])
+def test_pdf_report_download_generates_then_reuses(client, monkeypatch, tmp_path, from_history):
     """report.pdf 首次下载按需生成(与 HTML 导出同款管线),再次下载复用盘上产物。"""
     try:
         import pymupdf as fitz
@@ -430,6 +438,11 @@ def test_pdf_report_download_generates_then_reuses(client, monkeypatch, tmp_path
         )],
     )
 
+    if from_history:
+        from document_comparison.db import repository as db_repo
+        db_repo.save_compare_report(task_id, task.report)
+        task_manager._tasks.clear()
+
     response = client.get(f"/api/v1/compare/{task_id}/report.pdf")
 
     assert response.status_code == 200
@@ -441,11 +454,37 @@ def test_pdf_report_download_generates_then_reuses(client, monkeypatch, tmp_path
     assert response.content.startswith(b"%PDF")
     with fitz.open(stream=response.content, filetype="pdf") as doc:
         assert len(doc) >= 1
+        assert "单据编号:WEB-PDF-001" in "".join(page.get_text() for page in doc)
     assert external_pdf_report_path(task_id).is_file()
 
     again = client.get(f"/api/v1/compare/{task_id}/report.pdf")
     assert again.status_code == 200
     assert again.content == response.content
+
+
+@pytest.mark.parametrize("from_history", [False, True])
+@pytest.mark.parametrize("document_no", ["DOC-JSON-001", None])
+def test_compare_report_document_no_in_result_and_json_download(client, from_history, document_no):
+    from document_comparison.api.app import task_manager
+    from document_comparison.db import repository as db_repo
+    from document_comparison.models import TamperReport
+
+    task_id = task_manager.create("compare", document_no=document_no)
+    task = task_manager.get(task_id)
+    task.info.status = "done"
+    # 模拟新增字段前的报告：编号只存在于任务记录中。
+    task.report = TamperReport(source="s.docx", target="t.pdf")
+    if from_history:
+        db_repo.save_compare_report(task_id, task.report)
+        db_repo.update_task_status(task_id, "done")
+        task_manager._tasks.clear()
+
+    result = client.get(f"/api/v1/compare/{task_id}")
+    assert result.status_code == 200
+    assert result.json()["report"]["document_no"] == document_no
+    download = client.get(f"/api/v1/compare/{task_id}/report?format=json")
+    assert download.status_code == 200
+    assert download.json()["document_no"] == document_no
 
 
 def test_pdf_report_download_404_without_report(client, monkeypatch, tmp_path):
@@ -1344,7 +1383,7 @@ def test_get_compare_result_survives_no_inmemory_task(client):
 
     task_manager._tasks.clear()
 
-    db_repo.create_task("restart-1", "compare", target_names=["t.pdf"])
+    db_repo.create_task("restart-1", "compare", target_names=["t.pdf"], document_no="DOC-RESTART-1")
     db_repo.update_task_status(
         "restart-1", "done",
         overall_risk="clean",
@@ -1364,6 +1403,7 @@ def test_get_compare_result_survives_no_inmemory_task(client):
     assert body["overall_risk"] == "clean"
     assert body["elapsed"] == pytest.approx(1.23)
     assert body["report"]["overall_risk"] == "clean"
+    assert body["report"]["document_no"] == "DOC-RESTART-1"
 
 
 def test_download_report_from_pg_after_inmemory_cleared(client):

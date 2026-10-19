@@ -7,6 +7,7 @@ import { ApiError, statementAttachmentUrl } from '@/api/statement'
 import { useStatementTaskStore } from '@/stores/statementTask'
 import type {
   ChangeVerdict,
+  StatementAmountItem,
   StatementSummaryReport,
 } from '@/api/types'
 
@@ -130,6 +131,14 @@ const columnTotalsRows = computed(() => {
     .sort((a, b) => b.val - a.val)
 })
 
+function hasUnmatchedAmounts(items: StatementAmountItem[]): boolean {
+  return items.some((item) => item.grounding_status === 'unmatched')
+}
+
+const hasUnmatchedCandidates = computed(() =>
+  report.value?.files.some((file) => file.tables.some((table) => hasUnmatchedAmounts(table.items))) ?? false,
+)
+
 function tableSourceBadge(source: string | undefined): string {
   if (source === 'heuristic') return '启发式'
   if (source === 'llm') return 'LLM 指认'
@@ -183,7 +192,7 @@ function tableSourceBadge(source: string | undefined): string {
 
       <!-- 总合计大字 -->
       <section class="card hero">
-        <span class="hero-label">含税合计(所有文件)</span>
+        <span class="hero-label">含税合计(所有文件){{ hasUnmatchedCandidates ? ' · 含待复核候选金额' : '' }}</span>
         <span class="hero-num">¥{{ fmtMoney(report.grand_total) }}</span>
         <span class="hero-meta muted">
           {{ report.total_files }} 个文件 · {{ report.total_tables }} 张表 · {{ report.total_items }} 条金额
@@ -192,7 +201,7 @@ function tableSourceBadge(source: string | undefined): string {
 
       <!-- 按列汇总 + 列定位分布 -->
       <section class="card">
-        <h3 class="section-title">按金额列汇总(含税口径)</h3>
+        <h3 class="section-title">按金额列汇总(含税口径){{ hasUnmatchedCandidates ? ' · 含待复核候选金额' : '' }}</h3>
         <table v-if="columnTotalsRows.length" class="tbl">
           <thead>
             <tr><th>列名</th><th class="num-col">合计(元)</th></tr>
@@ -227,12 +236,12 @@ function tableSourceBadge(source: string | undefined): string {
             <span class="muted file-idx">#{{ f.file_index + 1 }}</span>
           </h3>
           <div class="file-meta">
-            <span class="file-total">合计 ¥{{ fmtMoney(f.total_amount) }}</span>
+            <span class="file-total">合计 ¥{{ fmtMoney(f.total_amount) }}{{ f.tables.some(t => hasUnmatchedAmounts(t.items)) ? ' · 含待复核候选金额' : '' }}</span>
             <span v-if="f.error" class="badge badge-none">失败</span>
             <span
               v-else-if="f.recognition_status === 'needs_review'"
               class="badge badge-none"
-            >OCR 待复核</span>
+            >{{ f.tables.some(t => hasUnmatchedAmounts(t.items)) ? '金额待复核' : 'OCR 待复核' }}</span>
             <span v-else class="badge badge-heuristic">识别可靠</span>
             <a
               class="btn"
@@ -257,8 +266,8 @@ function tableSourceBadge(source: string | undefined): string {
 
             <!-- 本表含税口径 -->
             <div v-if="t.tax_inclusive_method" class="verify-row">
-              <span class="muted">本表含税口径:</span>
-              <span class="verify-item ok">{{ t.tax_inclusive_method }}</span>
+              <span class="muted">本表含税口径{{ hasUnmatchedAmounts(t.items) ? '(含待复核候选金额)' : '' }}:</span>
+              <span class="verify-item" :class="{ ok: !hasUnmatchedAmounts(t.items) }">{{ t.tax_inclusive_method }}</span>
               <span class="verify-item">¥{{ fmtMoney(t.tax_inclusive_total) }}</span>
             </div>
 
@@ -284,9 +293,10 @@ function tableSourceBadge(source: string | undefined): string {
                   <th class="row-idx">行</th>
                   <th>标识</th>
                   <th>金额列</th>
-                  <th>OCR 原文</th>
+                  <th>原始金额</th>
                   <th class="num-col">金额(元)</th>
                   <th class="src-col">定位</th>
+                  <th class="src-col">OCR 核对</th>
                 </tr>
               </thead>
               <tbody>
@@ -301,6 +311,11 @@ function tableSourceBadge(source: string | undefined): string {
                       class="badge-sm"
                       :class="`badge-${t.column_source[it.column] ?? 'none'}`"
                     >{{ tableSourceBadge(t.column_source[it.column]) }}</span>
+                  </td>
+                  <td>
+                    <span v-if="it.grounding_status === 'unmatched'" class="badge-sm badge-none">未匹配 · 待复核</span>
+                    <span v-else-if="it.grounding_status === 'matched'" class="badge-sm badge-heuristic">已匹配</span>
+                    <span v-else class="muted">—</span>
                   </td>
                 </tr>
               </tbody>

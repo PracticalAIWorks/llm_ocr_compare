@@ -203,8 +203,8 @@ def _process_one_pdf(
                     page_png_cache[page_index] = b""
             return page_png_cache[page_index]
 
-        # 各页 OCR 纯文本(所有 block.content 拼接),作为 LLM 金额抽取的 grounding
-        # 逐字溯源依据:LLM 返回的每个金额必须能在其中找到,否则丢弃。
+        # 各页 OCR 纯文本(所有 block.content 拼接),用于核对 LLM 金额。
+        # 未匹配的候选金额保留在报告中,整份文件标记待复核。
         # (page_texts 已在上方发票识别时构建,这里复用)
         page_groundings = page_texts
 
@@ -280,6 +280,16 @@ def _process_one_pdf(
             summary.table_index = index
             for item in summary.items:
                 item.table_index = index
+        unmatched_pages = sorted({
+            ts.page_index
+            for ts in table_summaries
+            if any(item.grounding_status == "unmatched" for item in ts.items)
+        })
+        for page_index in unmatched_pages:
+            diagnostics.append(PageRecognitionDiagnostic(
+                page_index=page_index, source="fallback", reliable=False,
+                reasons=["LLM 补出的金额未在本页 OCR 文本或表格单元格中匹配，合计含待复核候选金额"],
+            ))
         recognition_needs_review = any(not d.reliable for d in diagnostics)
 
         # 单 PDF 合计(含税口径):用各表 tax_inclusive_total 而非所有 column_sums,
@@ -496,8 +506,8 @@ def _summarize_one_table(
             return col_summary
         summary = col_summary
 
-    # 第 3 步:列指认仍未抽到金额(典型:发票纯数字无单位 + 表头乱码)→ LLM 直接抽取
-    # 数据行金额,逐值 grounding 校验通过后由代码累加。
+    # 第 3 步:列指认仍未抽到金额 → LLM 直接抽取数据行金额。
+    # OCR 未匹配项仍参与候选合计,并通过 item.grounding_status 标待复核。
     amount_items = _llm_extract_amount_items(
         table,
         png=png,
@@ -508,7 +518,7 @@ def _summarize_one_table(
         page_index=page_index,
     )
     if amount_items:
-        # 把通过 grounding 校验的金额写入 column_sums(代码累加,不破坏聚合路径);
+        # 把抽出的金额写入 column_sums(代码累加,不破坏聚合路径);
         # column_source 标 "llm" 表明本表金额由 LLM 兜底抽取得到。
         col_name, value, tax_total = _llm_amount_summary_fields(amount_items)
         summary.column_sums = {col_name: value}
@@ -536,12 +546,20 @@ def _llm_extract_amount_items(
     table_index: int,
     page_index: int,
 ) -> list[StatementAmountItem]:
-    """第 3 级:LLM 直接抽取数据行金额(仅返回通过 grounding 校验的项)。
+    """第 3 级:LLM 直接抽取数据行金额(含待复核的未匹配项)。
 
     失败/异常返回空 list(由调用方标 needs_review)。求和仍由调用方用 Decimal 完成。
     """
     # 延迟导入(LLM 引擎实例化需要 api_base 配置)
     from .statement.llm_amount_extract import llm_extract_amounts
+
+    # OCR 的 content 可能仅含表格描述,完整数值保存在 table.headers/rows。
+    # 当前物理页的原始单元格同样是 OCR 溯源证据,不能因缺少文本副本而丢弃。
+    grounding = "\n".join([
+        page_groundings,
+        " | ".join(table.headers),
+        *(" | ".join(str(cell or "") for cell in row) for row in table.rows),
+    ])
 
     try:
         logger.info(
@@ -552,7 +570,7 @@ def _llm_extract_amount_items(
             png,
             list(table.headers),
             list(table.rows),
-            page_groundings,
+            grounding,
             file_index=file_index,
             file_name=file_name,
             table_index=table_index,
@@ -575,7 +593,7 @@ def _extract_whole_page_amounts(
     """整页文本兜底:OCR 未产出结构化表格时,把整页 OCR 文本作为"隐式表"喂给
     LLM 金额抽取(图片型发票/收据的典型场景)。
 
-    grounding 即 page_text 本身,LLM 返回的每个金额必须能在其中逐字溯源。
+    grounding 即 page_text 本身,未匹配的金额保留并标为待复核。
     成功返回带 column_sums 的 summary;无金额/失败返回 None。
     """
     from .statement.llm_amount_extract import llm_extract_amounts

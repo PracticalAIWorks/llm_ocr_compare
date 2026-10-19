@@ -71,6 +71,22 @@ docker compose up -d
 docker compose up -d --build
 ```
 
+向阿里云镜像仓库发布时，先构建再推送应用服务镜像：
+
+```bash
+docker compose build --provenance=false llm-ocr-compare
+docker compose push llm-ocr-compare
+```
+
+当前阿里云仓库会拒收本机 BuildKit 默认添加的证明清单(`application/vnd.oci.empty.v1+json`)。`--provenance=false` 已在本机验证可生成单平台镜像；也可先在当前 shell 执行 `export BUILDX_NO_DEFAULT_ATTESTATIONS=1`，再使用普通的 `docker compose build`。仅把该变量写进 Compose 的 `.env` 不会传给 Buildx，已验证仍会生成证明清单。构建日志中不应出现 `exporting attestation manifest`；否则后续 `docker compose push` 仍可能失败。对于**此前已构建**且出现该错误的镜像，可直接推送已有的 `linux/amd64` 平台清单，无需重建：
+
+```bash
+image=$(docker compose config --images | awk '/\/llm-ocr-compare:/ { print; exit }')
+docker image push --platform linux/amd64 "$image"
+```
+
+推送前确认 `.env` 中的 `DC_VERSION` 对应本次要发布的镜像。
+
 `up -d` 不会把源码变更打入已有镜像。升级重建同一个应用容器，保留数据目录、端口和业务调用地址。
 启动会自动更新版本记录；原状态为 `SERVING` 时继续接单，无需先执行发布控制命令。
 

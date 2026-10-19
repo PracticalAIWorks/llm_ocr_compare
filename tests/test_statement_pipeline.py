@@ -3,6 +3,7 @@
 用 mock OCR 引擎(让 recognize 返回构造好的 Block(label="table", table=TableStructure))
 避开真实 LLM 调用,覆盖 pipeline 的所有分支。
 """
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -359,6 +360,43 @@ def test_four_page_heuristic_continuation_and_total_are_not_extracted_twice(monk
     render.assert_not_called()
 
 
+@pytest.mark.parametrize("cell_format", ["{amount}", "{amount:.2f}"])
+def test_second_page_ocr_cells_ground_model_amounts(monkeypatch, tmp_path, cell_format):
+    """OCR 的 content 仅为表格描述时,结构化单元格仍是本页溯源依据。"""
+    import document_comparison.statement_pipeline as sp
+    import document_comparison.statement.llm_column_detect as lcd
+
+    pdf_path = _make_real_pdf(tmp_path, num_pages=2)
+    first = _make_table_block(["项目", "金额"], [["第一页", "100元"]])
+    second = _make_table_block(
+        ["项目", "金额(含税)"],
+        [[name, cell_format.format(amount=amount)] for name, amount in
+         [("A", 1500), ("B", 1298), ("C", 472), ("合计", 3270)]],
+        page_index=1,
+    )
+    second.content = "对账单续表，共三条明细及合计行"
+    _patch_get_ocr_engine(monkeypatch, _make_mock_reader([[first], [second]]))
+    _patch_page_metas(monkeypatch, 2)
+    monkeypatch.setattr(sp, "render_page", lambda *args: b"fake-png")
+    monkeypatch.setattr(lcd, "llm_detect_amount_columns", lambda *args, **kw: None)
+    calls = []
+
+    def post(self, payload, kind):
+        assert kind == "statement-amount"
+        calls.append(payload)
+        return '\n\n{"items": [{"amount": "1500"}, {"amount": "1298"}, {"amount": "472"}]}'
+
+    monkeypatch.setattr("document_comparison.ocr.llm.LLMOCREngine._post_chat", post)
+    report = run_statement_pipeline([pdf_path], ["statement.pdf"])
+    assert report.grand_total == 3370
+    assert report.total_items == 4
+    assert report.verdict == "clean"
+    items = report.files[0].tables[1].items
+    assert [item.value for item in items] == [1500, 1298, 472]
+    assert all(item.page_index == 1 for item in items)
+    assert len(calls) == 1  # 成功后不能整页重复计入
+
+
 @pytest.mark.parametrize("enable_fallback", [False, True])
 def test_unresolved_later_page_marks_partial_amount_for_review(monkeypatch, tmp_path, enable_fallback):
     """后续页无法核验时不能把第一页金额当作完整文件金额标 clean。"""
@@ -641,6 +679,81 @@ def test_llm_fallback_failure_raises(monkeypatch, tmp_path):
 
 
 # —— 第三级:LLM 金额抽取(发票纯数字场景)——
+
+@pytest.mark.parametrize("ocr_cell,expected_statuses", [
+    ("1680.00", ["matched", "unmatched"]),
+    ("模糊", ["unmatched", "unmatched"]),
+])
+def test_llm_amount_missing_from_ocr_is_kept_and_report_needs_review(
+    monkeypatch, tmp_path, ocr_cell, expected_statuses,
+):
+    """部分或全部金额被 OCR 漏掉时,LLM 候选仍进入合计并触发复核。"""
+    import document_comparison.statement_pipeline as sp
+    import document_comparison.statement.llm_column_detect as lcd
+
+    block = Block(
+        block_id="p0-t0", page_index=0, label="table",
+        content=f"项目 | 金额\nA | {ocr_cell}",
+        table=TableStructure(headers=["项目", "金额"], rows=[["A", ocr_cell]]),
+    )
+    _patch_get_ocr_engine(monkeypatch, _make_mock_reader([[block]]))
+    _patch_page_metas(monkeypatch, 1)
+    monkeypatch.setattr(sp, "render_page", lambda *args: b"fake-png")
+    monkeypatch.setattr(lcd, "llm_detect_amount_columns", lambda *args, **kw: None)
+    monkeypatch.setattr(
+        "document_comparison.ocr.llm.LLMOCREngine._post_chat",
+        lambda self, payload, kind: json.dumps({"items": [
+            {"amount": "1680.00"}, {"amount": "640.00"},
+        ]}),
+    )
+
+    report = run_statement_pipeline([_make_real_pdf(tmp_path)], ["invoice.pdf"])
+    assert report.grand_total == 2320.0
+    assert report.files[0].total_amount == 2320.0
+    assert report.verdict == "needs_review"
+    assert report.files[0].recognition_status == "needs_review"
+    assert [item.grounding_status for item in report.files[0].tables[0].items] == expected_statuses
+    assert [item["grounding_status"] for item in report.model_dump()["files"][0]["tables"][0]["items"]] == expected_statuses
+    assert any("候选金额" in reason for reason in report.reasons)
+
+
+@pytest.mark.parametrize("mode", ["heuristic", "llm-table", "llm-page"])
+@pytest.mark.parametrize("amounts,expected_total", [
+    (["100.10", "-0.20"], 99.9),
+    (["-100.10", "-0.20"], -100.3),
+    (["100.10", "-100.10"], 0.0),
+])
+def test_signed_amount_rows_reach_file_and_grand_totals(
+    monkeypatch, tmp_path, mode, amounts, expected_total,
+):
+    """正负混合、全负和抵消为零,均保留全部明细并用 Decimal 汇总。"""
+    import document_comparison.statement_pipeline as sp
+    import document_comparison.statement.llm_column_detect as lcd
+
+    cells = [amount + "元" if mode == "heuristic" else amount for amount in amounts]
+    rows = [[f"明细{i}", cell] for i, cell in enumerate(cells)]
+    block = Block(
+        block_id="p0-t0", page_index=0,
+        label="text" if mode == "llm-page" else "table",
+        content="项目 | 金额\n" + "\n".join(" | ".join(row) for row in rows),
+        table=None if mode == "llm-page" else TableStructure(headers=["项目", "金额"], rows=rows),
+    )
+    _patch_get_ocr_engine(monkeypatch, _make_mock_reader([[block]]))
+    _patch_page_metas(monkeypatch, 1)
+    monkeypatch.setattr(sp, "render_page", lambda *args: b"fake-png")
+    monkeypatch.setattr(lcd, "llm_detect_amount_columns", lambda *args, **kw: None)
+    post = MagicMock(return_value=json.dumps({"items": [{"amount": a} for a in amounts]}))
+    monkeypatch.setattr("document_comparison.ocr.llm.LLMOCREngine._post_chat", post)
+
+    report = run_statement_pipeline([_make_real_pdf(tmp_path)], ["signed.pdf"])
+    assert report.grand_total == expected_total
+    assert report.files[0].total_amount == expected_total
+    assert report.grand_totals_by_column == {"金额" if mode != "llm-page" else "金额(llm)": expected_total}
+    assert report.verdict == "clean"
+    assert report.total_items == len(amounts)
+    assert [item.value for table in report.files[0].tables for item in table.items] == [float(a) for a in amounts]
+    assert post.call_count == (0 if mode == "heuristic" else 1)
+
 
 def test_invoice_amount_extraction_cascade(monkeypatch, tmp_path):
     """正则抽空(纯数字无单位)+ 列指认也抽空 → 第三级 LLM 金额抽取成功,代码累加。
